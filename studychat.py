@@ -47,8 +47,10 @@ import queue
 import re
 import socket
 import ssl
+import sys
 import threading
 import time
+import traceback
 import urllib.error
 import urllib.request
 import uuid
@@ -225,6 +227,26 @@ def name_color(name):
     return PALETTE[sum(map(ord, name)) % len(PALETTE)]
 
 
+LOG_PATH = os.path.join(os.path.expanduser("~"), ".studychat.log")
+_NON_BMP = re.compile("[\U00010000-\U0010ffff]")
+
+
+def bmp(s):
+    """Old versions of Tk (common on Macs) choke on emoji; swap them for ?"""
+    return _NON_BMP.sub("?", s)
+
+
+def log(text):
+    """Quiet diagnostics in ~/.studychat.log (handy if something freezes)."""
+    try:
+        if os.path.exists(LOG_PATH) and os.path.getsize(LOG_PATH) > 200000:
+            os.replace(LOG_PATH, LOG_PATH + ".old")
+        with open(LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(time.strftime("%Y-%m-%d %H:%M:%S ") + text.rstrip() + "\n")
+    except OSError:
+        pass
+
+
 # ---------------------------------------------------------------- networking
 class Net:
     """Text goes out by UDP broadcast. Images are announced by broadcast, then
@@ -240,23 +262,10 @@ class Net:
         self.closed = False
         self.ping_every = WIFI_PING_EVERY
 
-        self.rx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.rx.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        if hasattr(socket, "SO_REUSEPORT"):
-            try:
-                self.rx.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-            except OSError:
-                pass
-        self.rx.bind(("", PORT))
-
-        self.tx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.tx.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-
-        self.targets = [("255.255.255.255", PORT)]
-        ip = self._local_ip()
-        if ip:
-            # most home/dorm networks are /24; also hit that broadcast address
-            self.targets.append((ip.rsplit(".", 1)[0] + ".255", PORT))
+        self.rx = self._make_rx()
+        self.tx = self._make_tx()
+        self.targets = []
+        self._refresh_targets()
 
         # small TCP server that hands out images we've sent
         self.srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -267,6 +276,33 @@ class Net:
 
         threading.Thread(target=self._listen, daemon=True).start()
         threading.Thread(target=self._serve, daemon=True).start()
+
+    @staticmethod
+    def _make_rx():
+        rx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        rx.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if hasattr(socket, "SO_REUSEPORT"):
+            try:
+                rx.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+            except OSError:
+                pass
+        rx.bind(("", PORT))
+        return rx
+
+    @staticmethod
+    def _make_tx():
+        tx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        tx.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        return tx
+
+    def _refresh_targets(self):
+        """Where to broadcast. Redone regularly in case the wifi changed."""
+        targets = [("255.255.255.255", PORT)]
+        ip = self._local_ip()
+        if ip:
+            # most home/dorm networks are /24; also hit that broadcast address
+            targets.append((ip.rsplit(".", 1)[0] + ".255", PORT))
+        self.targets = targets
 
     @staticmethod
     def _local_ip():
@@ -281,9 +317,16 @@ class Net:
 
     def _broadcast(self, msg):
         data = json.dumps(msg).encode("utf-8")
+        failed = 0
         for target in self.targets:
             try:
                 self.tx.sendto(data, target)
+            except OSError:
+                failed += 1
+        if self.targets and failed == len(self.targets):
+            try:                              # sending socket went bad
+                self.tx.close()
+                self.tx = self._make_tx()
             except OSError:
                 pass
 
@@ -291,6 +334,8 @@ class Net:
         msg = {"app": "studychat", "room": self.room, "id": uuid.uuid4().hex,
                "name": self.name, "text": text, "type": kind,
                "uid": self.uid}
+        if kind == "ping":
+            self._refresh_targets()
         self.seen.add(msg["id"])
         self._broadcast(msg)
         return msg
@@ -338,11 +383,30 @@ class Net:
 
     # --- receiving
     def _listen(self):
+        errors = 0
         while True:
             try:
                 data, addr = self.rx.recvfrom(65535)
+            except OSError:
+                # wifi changed or the computer woke up: don't spin, rebuild
+                errors += 1
+                time.sleep(min(3.0, 0.25 * errors))
+                if errors >= 2:
+                    try:
+                        self.rx.close()
+                    except OSError:
+                        pass
+                    try:
+                        self.rx = self._make_rx()
+                        if errors == 2:
+                            log("wifi listener restarted")
+                    except OSError:
+                        pass
+                continue
+            errors = 0
+            try:
                 msg = json.loads(data.decode("utf-8"))
-            except (OSError, ValueError):
+            except ValueError:
                 continue
             if not isinstance(msg, dict):
                 continue
@@ -558,6 +622,10 @@ class Presence:
         else:
             self.peers[uid] = (str(msg.get("name", "?"))[:20], now)
 
+    def refresh_all(self, now):
+        """After the computer sleeps, don't announce that everyone left."""
+        self.peers = {u: (n, now) for u, (n, _t) in self.peers.items()}
+
     def expired(self, now, ttl):
         gone = [(u, n) for u, (n, t) in self.peers.items() if now - t > ttl]
         for u, _ in gone:
@@ -716,7 +784,18 @@ class Overlay:
     def __init__(self, root, net, inbox):
         import tkinter as tk
         self.tk = tk
+
+        class SafeText(tk.Text):
+            def insert(self, index, chars, *args):
+                try:
+                    return super().insert(index, chars, *args)
+                except tk.TclError:          # emoji on old Tk versions
+                    return super().insert(index, bmp(chars), *args)
+
         self.root, self.net, self.inbox = root, net, inbox
+        root.report_callback_exception = self._on_error
+        self.last_tick = time.time()
+        self.tick_n = 0
         self.history = []
         self.state = "collapsed"
         self.popup_until = 0
@@ -761,12 +840,16 @@ class Overlay:
                                      fg=MUTED, cursor="hand2", font=F(-2))
         self.settings_lbl.pack(side="right", padx=6)
         self.settings_lbl.bind("<Button-1>", lambda e: self.open_settings())
+        self.online_lbl = tk.Label(self.header, text="1 online", bg=BAR,
+                                   fg=MUTED, cursor="hand2", font=F(-2))
+        self.online_lbl.pack(side="right", padx=6)
+        self.online_lbl.bind("<Button-1>", lambda e: self.show_who())
         for w in (self.header, self.title):
             w.bind("<ButtonPress-1>", self._drag_start)
             w.bind("<B1-Motion>", self._drag_move)
             w.bind("<ButtonRelease-1>", self._drag_end)
 
-        self.text = tk.Text(root, bg=BG, fg=FG, bd=0, highlightthickness=0,
+        self.text = SafeText(root, bg=BG, fg=FG, bd=0, highlightthickness=0,
                             wrap="word", font=F(), padx=6, pady=4,
                             state="disabled", cursor="arrow")
         self.text.tag_config("sys", foreground=MUTED)
@@ -846,6 +929,7 @@ class Overlay:
         self.title.config(bg=BAR, fg=MUTED, font=F(-2))
         self.close_lbl.config(bg=BAR, fg=MUTED, font=F(-1))
         self.settings_lbl.config(bg=BAR, fg=MUTED, font=F(-2))
+        self.online_lbl.config(bg=BAR, fg=MUTED, font=F(-2))
         self.text.config(bg=BG, fg=FG, font=F())
         self.text.tag_config("sys", foreground=MUTED)
         self.entry_wrap.config(bg=BAR)
@@ -876,6 +960,17 @@ class Overlay:
             self.busy = False
             self.settings_win = None
             self.note("couldn't open settings")
+
+    def online_names(self):
+        """Everyone we know is in the room right now, you first."""
+        others = sorted(n for n, _t in self.presence.peers.values())
+        return [f"{self.net.name} (you)"] + others
+
+    def update_online(self):
+        self.online_lbl.config(text=f"{len(self.online_names())} online")
+
+    def show_who(self):
+        self.note("Online: " + ", ".join(self.online_names()))
 
     def _on_text_click(self, _e):
         if self.state != "active":
@@ -1037,7 +1132,23 @@ class Overlay:
         return "break"
 
     # ---- content
+    def _on_error(self, exc, val, tb):
+        log("callback error: "
+            + "".join(traceback.format_exception(exc, val, tb)))
+
     def redraw(self):
+        try:
+            self._redraw()
+        except Exception:
+            log("redraw failed: " + traceback.format_exc())
+        finally:
+            try:                             # never leave the chat editable
+                self.text.config(state="disabled")
+                self.text.see("end")
+            except Exception:
+                pass
+
+    def _redraw(self):
         t = self.text
         t.config(state="normal")
         t.delete("1.0", "end")
@@ -1096,6 +1207,9 @@ class Overlay:
         if text == "/settings":
             self.open_settings()
             return
+        if text == "/who":
+            self.show_who()
+            return
         if text.startswith("/img "):
             self.send_file(text[5:])
             return
@@ -1104,21 +1218,36 @@ class Overlay:
 
     # ---- loops
     def poll(self):
+        # One bad message must never stop the loop, or the chat looks frozen.
         try:
             while True:
-                msg = self.inbox.get_nowait()
-                if msg.get("type") == "summon":
-                    self.set_state("active")
-                    continue
-                msg["name"] = str(msg.get("name", "?"))[:20]
-                msg["text"] = str(msg.get("text", ""))[:2000]
-                self.presence.seen(msg, time.time())
-                if msg.get("type") == "ping":      # quiet "still here" signal
-                    continue
-                self._deliver(msg)
-        except queue.Empty:
-            pass
-        self.root.after(100, self.poll)
+                try:
+                    msg = self.inbox.get_nowait()
+                except queue.Empty:
+                    break
+                try:
+                    self._handle_incoming(msg)
+                except Exception:
+                    log("bad incoming message: " + traceback.format_exc())
+            self.update_online()
+        except Exception:
+            log("poll failed: " + traceback.format_exc())
+        finally:
+            self.root.after(100, self.poll)
+
+    def _handle_incoming(self, msg):
+        if msg.get("type") == "summon":
+            self.set_state("active")
+            return
+        msg["name"] = str(msg.get("name", "?"))[:20]
+        msg["text"] = str(msg.get("text", ""))[:2000]
+        self.presence.seen(msg, time.time())
+        if msg.get("type") == "join" and msg.get("uid") != self.net.uid:
+            # say hi back right away so the newcomer sees who's here
+            self.net.send("", kind="ping")
+        if msg.get("type") == "ping":          # quiet "still here" signal
+            return
+        self._deliver(msg)
 
     def _deliver(self, msg):
         self.add(msg)
@@ -1129,22 +1258,37 @@ class Overlay:
             self.set_state("popup")
 
     def tick(self):
-        now = time.time()
-        # tell others we're still here, and notice when someone stops
-        if now - self.last_ping > self.net.ping_every:
-            self.last_ping = now
-            self.net.send("", kind="ping")
-        for pname in self.presence.expired(now, 3 * self.net.ping_every):
-            self._deliver({"type": "leave", "name": pname, "text": ""})
-        if self.state == "popup" and now > self.popup_until:
-            self.set_state("collapsed")
-        elif (self.state == "active" and not self.busy
-              and not self.entry.get()
-              and now - self.last_activity > ACTIVE_IDLE_SECONDS):
-            self.set_state("collapsed")
-        # keep sitting above other windows
-        self.root.attributes("-topmost", True)
-        self.root.after(500, self.tick)
+        # Wrapped so an error can't stop the timer (that would leave popups
+        # stuck open and the chat looking frozen).
+        try:
+            now = time.time()
+            late = now - self.last_tick
+            self.last_tick = now
+            if late > 5:                     # computer slept or app was frozen
+                log(f"timer was {late:.0f}s late (sleep, or the system "
+                    "slowed the app down)")
+                self.presence.refresh_all(now)
+                self.last_ping = 0
+            # tell others we're still here, and notice when someone stops
+            if now - self.last_ping > self.net.ping_every:
+                self.last_ping = now
+                self.net.send("", kind="ping")
+            for pname in self.presence.expired(now, 3 * self.net.ping_every):
+                self._deliver({"type": "leave", "name": pname, "text": ""})
+            if self.state == "popup" and now > self.popup_until:
+                self.set_state("collapsed")
+            elif (self.state == "active" and not self.busy
+                  and not self.entry.get()
+                  and now - self.last_activity > ACTIVE_IDLE_SECONDS):
+                self.set_state("collapsed")
+            # keep sitting above other windows (every couple of seconds)
+            self.tick_n += 1
+            if self.tick_n % 4 == 0:
+                self.root.attributes("-topmost", True)
+        except Exception:
+            log("tick failed: " + traceback.format_exc())
+        finally:
+            self.root.after(500, self.tick)
 
 
 def main():
@@ -1189,16 +1333,28 @@ def main():
         print("Could not open the network port:", e)
         return
 
-    # optional global hotkey (pip install pynput)
-    try:
-        from pynput import keyboard
-        keyboard.GlobalHotKeys(
-            {"<ctrl>+<alt>+c": lambda: inbox.put({"type": "summon"})}).start()
-    except Exception:
-        pass
+    # optional global hotkey (pip install pynput). Off on Mac by default,
+    # because pynput can freeze or crash Tk apps there.
+    if sys.platform != "darwin" or os.environ.get("STUDYCHAT_HOTKEY") == "1":
+        try:
+            from pynput import keyboard
+            keyboard.GlobalHotKeys(
+                {"<ctrl>+<alt>+c": lambda: inbox.put({"type": "summon"})}
+            ).start()
+        except Exception:
+            pass
 
     root.deiconify()
     overlay = Overlay(root, net, inbox)
+    try:
+        tkver = str(root.tk.call("info", "patchlevel"))
+        log(f"started: python {sys.version.split()[0]}, tk {tkver}, "
+            f"{sys.platform}, {net.mode} mode")
+        if tkver.startswith("8.5"):
+            overlay.note("warning: your Python uses an old, buggy Tk (8.5) "
+                         "that can freeze. Install Python from python.org.")
+    except Exception:
+        pass
     net.send("joined", kind="join")
     overlay.add({"type": "join", "name": "You", "text": ""})
     try:
