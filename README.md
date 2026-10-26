@@ -1,1 +1,1 @@
-# Study-chat
+# Download and run
