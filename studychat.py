@@ -1081,6 +1081,13 @@ class Overlay:
             # a normal window that macOS can give keyboard focus to.
             root.tk.call("tk::unsupported::MacWindowStyle", "style",
                          root._w, "document", ("noTitleBar",))
+        elif (sys.platform.startswith("linux")
+              and os.environ.get("STUDYCHAT_BORDERLESS") != "1"):
+            # Most Linux desktops (GNOME/Fedora, Wayland) never give keyboard
+            # focus to windows with no title bar, so typing is impossible.
+            # Use a normal window instead. If your desktop handles borderless
+            # windows fine, set STUDYCHAT_BORDERLESS=1 to get the slim look.
+            root.title("Study chat")
         else:
             root.overrideredirect(True)
         root.attributes("-topmost", True)
