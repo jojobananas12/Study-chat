@@ -101,7 +101,7 @@ CHECK_UPDATES = os.environ.get("STUDYCHAT_NO_UPDATE") != "1"
 
 # When someone with one of these names (lowercase) joins, your copy of the
 # chat sends them this message. Add or delete lines to change it.
-JOIN_GREETINGS = {"david": "Fuck you David!"}
+JOIN_GREETINGS = {"david": "Love you David!"}
 GREETING_SENDER = "Admin"        # the name those messages appear under
 
 # ============================================================== settings ====
