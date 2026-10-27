@@ -28,7 +28,8 @@ School wifi:
     must pick the same mode. Online mode is NOT private, so use a long,
     hard-to-guess room name.
 
-Commands: /reels [link] (small Instagram window; needs pywebview),
+Commands: /reels [link] (small Instagram window; needs Chrome, Chromium,
+  Edge or Brave, or pywebview),
   /who (who's online), /update (check for a new version),
   /version, /settings, /img, /quit. The chat checks GitHub for a newer
   version when it starts; set STUDYCHAT_NO_UPDATE=1 to turn that off.
@@ -1284,8 +1285,8 @@ class Overlay:
             # here: it would change your whole browser, and Instagram
             # switches to its phone layout at this width anyway.)
             x = max(0, self.root.winfo_screenwidth() - 420)
-            cmd = [exe, f"--app={url}", "--window-size=390,720",
-                   f"--window-position={x},40"]
+            cmd = exe + [f"--app={url}", "--window-size=390,720",
+                         f"--window-position={x},40"]
             note = ""
         elif importlib.util.find_spec("webview") is not None:
             cmd = [sys.executable, os.path.abspath(__file__), "--reels", url]
@@ -1294,8 +1295,10 @@ class Overlay:
         else:                                # nothing small is possible
             webbrowser.open(url)
             self.note("opened in your normal browser (so you're logged in). "
-                      "For a small phone-sized window, install Chrome, Edge "
-                      "or Brave.")
+                      "For a small phone-sized window, install Chrome, "
+                      "Chromium, Edge or Brave"
+                      + (" (on Fedora: sudo dnf install chromium)"
+                         if sys.platform.startswith("linux") else "") + ".")
             return
         try:
             self.reels_proc = subprocess.Popen(cmd)
@@ -2068,45 +2071,70 @@ def default_browser_hint():
     except Exception:
         return ""
     raw = raw.lower()
-    for hint, words in (("chrome", ("chrome",)), ("edge", ("edge", "msedge")),
-                        ("brave", ("brave",))):
+    for hint, words in (("chrome", ("chrome",)), ("chromium", ("chromium",)),
+                        ("edge", ("edge", "msedge")), ("brave", ("brave",))):
         if any(w in raw for w in words):
             return hint
     return ""
 
 
+# Linux program names and Flatpak ids for Chrome-family browsers
+_LINUX_NAMES = (("google-chrome-stable", "chrome"), ("google-chrome", "chrome"),
+                ("chromium", "chromium"), ("chromium-browser", "chromium"),
+                ("microsoft-edge-stable", "edge"), ("microsoft-edge", "edge"),
+                ("brave-browser", "brave"), ("brave-browser-stable", "brave"),
+                ("brave", "brave"))
+_FLATPAKS = {"com.google.Chrome": "chrome", "org.chromium.Chromium": "chromium",
+             "com.brave.Browser": "brave", "com.microsoft.Edge": "edge",
+             "io.github.ungoogled_software.ungoogled_chromium": "chromium"}
+
+
 def find_chromium():
-    """Path to Chrome, Edge or Brave, if one is installed. The computer's
-    default browser comes first, since that is the one you most likely
-    stay logged in to Instagram on."""
+    """The command (a list) that starts Chrome, Edge, Brave or Chromium, or
+    None if none is installed. Works on Windows, Mac and Linux (including
+    Fedora, with normal, Snap or Flatpak installs). The computer's default
+    browser comes first, since that is the one you most likely stay logged
+    in to Instagram on."""
     env = os.environ
-    cands = []                                   # (which, path)
+    cands = []                                   # (which, [command...])
     if sys.platform == "win32":
         for base in (env.get("ProgramFiles"), env.get("ProgramFiles(x86)"),
                      env.get("LocalAppData")):
             if base:
-                cands += [
-                    ("edge", os.path.join(base, "Microsoft", "Edge",
-                                          "Application", "msedge.exe")),
-                    ("chrome", os.path.join(base, "Google", "Chrome",
-                                            "Application", "chrome.exe")),
-                    ("brave", os.path.join(base, "BraveSoftware",
-                                           "Brave-Browser", "Application",
-                                           "brave.exe"))]
+                for hint, parts in (
+                        ("edge", ("Microsoft", "Edge", "Application",
+                                  "msedge.exe")),
+                        ("chrome", ("Google", "Chrome", "Application",
+                                    "chrome.exe")),
+                        ("brave", ("BraveSoftware", "Brave-Browser",
+                                   "Application", "brave.exe"))):
+                    p = os.path.join(base, *parts)
+                    if os.path.isfile(p):
+                        cands.append((hint, [p]))
     elif sys.platform == "darwin":
         for hint, app in (("chrome", "Google Chrome"),
                           ("edge", "Microsoft Edge"),
-                          ("brave", "Brave Browser")):
-            cands.append((hint, f"/Applications/{app}.app/Contents/MacOS/"
-                                f"{app}"))
-    for name, hint in (("google-chrome", "chrome"), ("chromium", "chrome"),
-                       ("chromium-browser", "chrome"),
-                       ("microsoft-edge", "edge"),
-                       ("brave-browser", "brave")):
-        p = shutil.which(name)
-        if p:
-            cands.append((hint, p))
-    cands = [c for c in cands if os.path.isfile(c[1])]
+                          ("brave", "Brave Browser"),
+                          ("chromium", "Chromium")):
+            p = f"/Applications/{app}.app/Contents/MacOS/{app}"
+            if os.path.isfile(p):
+                cands.append((hint, [p]))
+    else:
+        for name, hint in _LINUX_NAMES:
+            p = shutil.which(name)
+            if p:
+                cands.append((hint, [p]))
+        if shutil.which("flatpak"):              # common on Fedora
+            try:
+                out = subprocess.run(
+                    ["flatpak", "list", "--app", "--columns=application"],
+                    capture_output=True, text=True, timeout=6).stdout
+                for app_id in out.split():
+                    if app_id in _FLATPAKS:
+                        cands.append((_FLATPAKS[app_id],
+                                      ["flatpak", "run", app_id]))
+            except Exception:
+                pass
     want = default_browser_hint()
     cands.sort(key=lambda c: c[0] != want)       # stable: default first
     return cands[0][1] if cands else None
