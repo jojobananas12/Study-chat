@@ -100,7 +100,11 @@ FG = "#e8e8e8"           # message text color
 MUTED = "#8a90a0"        # faded text color
 FONT_FAMILY = "Papyrus"
 MY_FONT = ""             # font for YOUR messages (blank = use the one above)
+<<<<<<< HEAD
 FONT_SIZE = 10
+=======
+FONT_SIZE = 14
+>>>>>>> ad08687930a3c663c97501213808c2323198c9e0
 
 # --- Window
 WIDTH = 360
