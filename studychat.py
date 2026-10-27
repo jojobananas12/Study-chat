@@ -38,7 +38,8 @@ School wifi:
     must pick the same mode. Online mode is NOT private, so use a long,
     hard-to-guess room name.
 
-Commands: /reels [link] (small Instagram window; needs Chrome, Chromium,
+Commands: /getfonts (install the free fonts your friends use),
+  /reels [link] (small Instagram window; needs Chrome, Chromium,
   Edge or Brave, or pywebview), /reelgif (send a GIF of the reel; same as
   the "gif" button, "/reelgif area" picks the screen area again),
   /who (who's online), /update (check for a new version),
@@ -95,7 +96,7 @@ except Exception:
 # ------------------------------------------------------------------ version
 # Bump VERSION whenever you publish a new studychat.py to GitHub. Everyone
 # running an older version is told, and can update with one click.
-VERSION = "1.1"
+VERSION = "1.3"
 UPDATE_REPO = "jojobananas12/Study-chat"     # github.com/<this>
 CHECK_UPDATES = os.environ.get("STUDYCHAT_NO_UPDATE") != "1"
 
@@ -135,7 +136,7 @@ BOTTOM_MARGIN = 70       # distance from the bottom edge of the screen
 # --- Behavior
 POPUP_SECONDS = 8        # how long a new-message popup stays open
 ACTIVE_IDLE_SECONDS = 20 # typing box closes itself after this much quiet
-POPUP_LINES = 6          # messages shown in the popup
+POPUP_LINES = 5          # most messages in the popup: the new one + 4 earlier
 MAX_HISTORY = 300        # messages kept in the chat
 DEFAULT_NAME = ""        # pre-filled in the "Your name" box
 DEFAULT_ROOM = "study"   # pre-filled in the "Room name" box
@@ -185,7 +186,8 @@ SPEC = [
     ("Behavior", "POPUP_SECONDS", "Popup stays open (seconds)", "int", 1, 120),
     ("Behavior", "ACTIVE_IDLE_SECONDS", "Close typing box after idle (seconds)",
      "int", 3, 600),
-    ("Behavior", "POPUP_LINES", "Messages shown in popup", "int", 1, 20),
+    ("Behavior", "POPUP_LINES", "Messages in popup (new + earlier unseen)",
+     "int", 1, 5),
     ("Behavior", "MAX_HISTORY", "Messages remembered", "int", 20, 2000),
     ("Behavior", "ALLOW_FLIP", "Let others flip your chat (1 = yes, 0 = no)",
      "int", 0, 1),
@@ -411,6 +413,92 @@ def install_update(info):
 
 
 # ---------------------------------------------------------------------- gifs
+# ---------------------------------------------------------------------- fonts
+GOOGLE_CSS = "https://fonts.googleapis.com/css2?family="
+
+
+def google_font_files(family):
+    """Direct links to a free Google font's files, as {"name", "urls"}, or
+    None if Google doesn't have a font by that name. Raises if Google can't
+    be reached."""
+    tried = []
+    for name in (family, family.title()):
+        if name not in tried:
+            tried.append(name)
+    for name in tried:
+        for spec in (":wght@400;700", ""):       # regular + bold, else regular
+            url = GOOGLE_CSS + urllib.parse.quote_plus(name) + spec
+            try:
+                css = _http_get(url, timeout=10, limit=300_000).decode(
+                    "utf-8", "replace")
+            except urllib.error.HTTPError as ex:
+                if ex.code in (400, 404):
+                    continue                     # no such font (or weight)
+                raise
+            links = re.findall(
+                r"url\((https://fonts\.gstatic\.com/[^)\s'\"]+)\)", css)
+            files = []
+            for u in links:
+                if (u.split("?")[0].lower().endswith((".ttf", ".otf"))
+                        and u not in files):
+                    files.append(u)
+            if files:
+                return {"name": name, "urls": files[:4]}
+            if links:
+                raise ValueError("only web-format files offered")
+    return None
+
+
+def download_font(url):
+    """Download one font file from Google's font server and sanity-check it."""
+    host = urllib.parse.urlparse(url).hostname or ""
+    if urllib.parse.urlparse(url).scheme != "https" \
+            or host != "fonts.gstatic.com":
+        raise ValueError("unexpected font address")
+    data = _http_get(url, timeout=40, limit=30_000_000)
+    if not data[:4] in (b"\x00\x01\x00\x00", b"OTTO", b"true"):
+        raise ValueError("that isn't a font file")
+    return data
+
+
+def font_dir():
+    home = os.path.expanduser("~")
+    if sys.platform == "win32":
+        base = os.environ.get("LOCALAPPDATA") or os.path.join(
+            home, "AppData", "Local")
+        return os.path.join(base, "Microsoft", "Windows", "Fonts")
+    if sys.platform == "darwin":
+        return os.path.join(home, "Library", "Fonts")
+    return os.path.join(home, ".local", "share", "fonts")
+
+
+def install_font_file(data, filename):
+    """Install a font for this user only (no admin password needed)."""
+    d = font_dir()
+    os.makedirs(d, exist_ok=True)
+    path = os.path.join(d, filename)
+    with open(path, "wb") as f:
+        f.write(data)
+    if sys.platform == "win32":
+        import ctypes
+        import winreg
+        kind = "OpenType" if data[:4] == b"OTTO" else "TrueType"
+        with winreg.CreateKey(
+                winreg.HKEY_CURRENT_USER,
+                r"Software\Microsoft\Windows NT\CurrentVersion\Fonts") as k:
+            winreg.SetValueEx(k, f"{os.path.splitext(filename)[0]} ({kind})",
+                              0, winreg.REG_SZ, path)
+        ctypes.windll.gdi32.AddFontResourceExW(path, 0, 0)   # usable now
+        ctypes.windll.user32.PostMessageW(0xFFFF, 0x001D, 0, 0)  # tell apps
+    elif sys.platform != "darwin":
+        try:
+            subprocess.run(["fc-cache", "-f", d], timeout=60,
+                           capture_output=True)
+        except Exception:
+            pass
+    return path
+
+
 MAX_GIF_FRAMES = 100       # more frames than this are skipped to save memory
 LIVE_GIFS = 5              # only the newest few GIFs in the chat animate
 
@@ -1164,6 +1252,8 @@ class Overlay:
         self.history = []
         self.state = "collapsed"
         self.popup_until = 0
+        self.seq = 0                        # count of messages delivered
+        self.seen_upto = 0                  # ...and how many you've seen
         self.last_activity = 0
         self.busy = False
         self.settings_win = None
@@ -1178,6 +1268,7 @@ class Overlay:
         self.anims = []                     # animated GIFs now in the chat
         self._installed = None              # fonts on this computer
         self.font_warned = set()
+        self.font_offers = {}               # lower name -> free font to offer
         self.full_anims = []                # ...and in full-size viewers
         self.presence = Presence()
         # Joining already says "I'm here", so the first "still here" signal
@@ -1280,6 +1371,9 @@ class Overlay:
         self.update_lbl = tk.Label(self.header, text="", bg=BAR,
                                    fg="#7be08a", cursor="hand2", font=F(-2))
         self.update_lbl.bind("<Button-1>", lambda e: self.update_cmd())
+        self.fonts_lbl = tk.Label(self.header, text="", bg=BAR,
+                                  fg="#7be08a", cursor="hand2", font=F(-2))
+        self.fonts_lbl.bind("<Button-1>", lambda e: self.fonts_cmd())
         for w in (self.header, self.title):
             w.bind("<ButtonPress-1>", self._drag_start)
             w.bind("<B1-Motion>", self._drag_move)
@@ -1325,15 +1419,21 @@ class Overlay:
         x, y = self.anchor_x, self.anchor_bottom - h
         self.root.geometry(f"{w}x{h}+{x}+{y}")
 
+    def _popup_msgs(self):
+        """What the popup shows: the newest message plus the ones before it
+        that arrived since you last had the chat open (at most POPUP_LINES,
+        so the new one and the 4 before it)."""
+        fresh = [m for m in self.history if m.get("_n", 0) > self.seen_upto]
+        return fresh[-max(1, min(5, POPUP_LINES)):] or self.history[-1:]
+
     def _geometry(self):
         """Size, position and opacity for the current state."""
         if self.state == "collapsed":
             self._place(PILL_W, PILL_H)
             alpha = PILL_ALPHA
         elif self.state == "popup":
-            last = self.history[-1] if self.history else {}
-            self._place(WIDTH, POPUP_IMG_HEIGHT
-                        if last.get("type") == "img" else POPUP_HEIGHT)
+            has_img = any(m.get("type") == "img" for m in self._popup_msgs())
+            self._place(WIDTH, POPUP_IMG_HEIGHT if has_img else POPUP_HEIGHT)
             alpha = POPUP_ALPHA
         else:
             self._place(WIDTH, ACTIVE_HEIGHT)
@@ -1345,6 +1445,8 @@ class Overlay:
             self.root.after_cancel(self._focus_job)
             self._focus_job = None
         self.state = state
+        if state == "active":
+            self.seen_upto = self.seq        # you're looking at everything now
         for w in (self.pill, self.header, self.text, self.entry_wrap):
             w.pack_forget()
         if state == "collapsed":
@@ -1433,6 +1535,7 @@ class Overlay:
         self.close_lbl.config(bg=BAR, fg=MUTED, font=F(-1))
         self.settings_lbl.config(bg=BAR, fg=MUTED, font=F(-2))
         self.reels_lbl.config(bg=BAR, fg=MUTED, font=F(-2))
+        self.fonts_lbl.config(bg=BAR, font=F(-2))
         self.clip_lbl.config(bg=BAR, fg=MUTED, font=F(-2))
         self.flip_lbl.config(bg=BAR, fg=MUTED, font=F(-2))
         self.online_lbl.config(bg=BAR, fg=MUTED, font=F(-2))
@@ -1850,6 +1953,7 @@ class Overlay:
             name = str(it.get("name", "?"))[:20]
             font = "".join(c for c in str(it.get("font", ""))
                            if c.isprintable())[:60].strip()
+            want = font
             if font:
                 font = self._usable_font(font, name)
             col = str(it.get("color") or "").lower()
@@ -1857,6 +1961,7 @@ class Overlay:
                 col = ""
             m = {"type": "msg", "id": mid, "name": name, "color": col,
                  "text": str(it.get("text", ""))[:2000], "font": font,
+                 "font_want": want if (want and not font) else "",
                  "uid": it.get("uid") if isinstance(it.get("uid"), str)
                  else "", "_old": True, "_hk": k}
             pos = 0
@@ -2291,7 +2396,8 @@ class Overlay:
         t = self.text
         t.config(state="normal")
         t.delete("1.0", "end")
-        msgs = self.history[-(POPUP_LINES if self.state == "popup" else MAX_HISTORY):]
+        msgs = (self._popup_msgs() if self.state == "popup"
+                else self.history[-MAX_HISTORY:])
         self.anims = []
         gifs = [m for m in msgs if m.get("type") == "img"
                 and isinstance(m.get("data"), bytes)
@@ -2399,6 +2505,9 @@ class Overlay:
         if text in ("/reelgif", "/reelgif area"):
             self.clip_reel(text.endswith("area"))
             return
+        if text == "/getfonts":
+            self.fonts_cmd()
+            return
         if text == "/reels" or text.startswith("/reels "):
             self.open_reels(text[6:])
             return
@@ -2431,25 +2540,145 @@ class Overlay:
         finally:
             self.root.after(100, self.poll)
 
+    def _font_set(self):
+        """Fonts installed on this computer (lower case)."""
+        try:
+            from tkinter import font as tkfont
+            return {f.lower() for f in tkfont.families(self.root)}
+        except Exception:
+            return set()
+
     def _usable_font(self, family, who):
         """The font to draw someone's message in. If it isn't installed on
-        this computer, use our normal font and say so once."""
+        this computer, use our normal font, and check (in the background)
+        whether it's a free font we can offer to download."""
         if self._installed is None:
-            try:
-                from tkinter import font as tkfont
-                self._installed = {f.lower() for f in
-                                   tkfont.families(self.root)}
-            except Exception:
-                self._installed = set()
+            self._installed = self._font_set()
         if not self._installed or family.lower() in self._installed:
             return family
-        if (who, family.lower()) not in self.font_warned:
-            self.font_warned.add((who, family.lower()))
-            self.add({"type": "sys", "name": "", "text":
-                      f"{who} uses the font \"{family}\", which isn't "
-                      "installed on this computer, so you see the normal "
-                      "font."})
+        key = family.lower()
+        if key not in self.font_warned:
+            self.font_warned.add(key)
+            threading.Thread(target=self._font_check_worker,
+                             args=(who, family), daemon=True).start()
         return ""
+
+    def _font_check_worker(self, who, family):
+        try:
+            res = google_font_files(family)
+            state = "offer" if res else "nodl"
+        except Exception:
+            res, state = None, "error"
+        self.inbox.put({"type": "font_result", "who": who, "family": family,
+                        "state": state, "res": res})
+
+    def _on_font_result(self, msg):
+        who, family = msg["who"], msg["family"]
+        if msg["state"] == "offer":
+            self.font_offers[family.lower()] = {
+                "family": family, "name": msg["res"]["name"],
+                "urls": msg["res"]["urls"]}
+            self.fonts_lbl.config(text=f"get fonts ({len(self.font_offers)})")
+            self.fonts_lbl.pack(side="right", padx=6)
+            text = (f'{who} uses the font "{family}". It\'s a free font: '
+                    'click "get fonts" in the top bar (or type /getfonts) '
+                    "to install it.")
+        elif msg["state"] == "nodl":
+            text = (f'{who} uses the font "{family}", which isn\'t installed '
+                    "here and isn't a free font that can be downloaded, so "
+                    "you see the normal font.")
+        else:
+            text = (f'{who} uses the font "{family}", which isn\'t installed '
+                    "on this computer, so you see the normal font.")
+        self._deliver({"type": "sys", "name": "", "text": text})
+
+    def fonts_cmd(self):
+        """Click on "get fonts" or /getfonts: ask, then download."""
+        if not self.font_offers:
+            self.note("no fonts to download right now")
+            return
+        from tkinter import messagebox
+        offers = list(self.font_offers.values())
+        names = "\n".join("  " + o["family"] for o in offers[:12])
+        self.busy = True
+        try:
+            ok = messagebox.askyesno(
+                "Study chat",
+                "Download and install these free fonts from Google Fonts?\n\n"
+                f"{names}\n\nThey are installed for your user only, and you "
+                "can remove them any time from your computer's font list.",
+                parent=self.root)
+        finally:
+            self.busy = False
+        if not ok:
+            return
+        self.font_offers = {}
+        self.fonts_lbl.pack_forget()
+        self.note("downloading fonts...")
+        threading.Thread(target=self._font_install_worker, args=(offers,),
+                         daemon=True).start()
+
+    def _font_install_worker(self, offers):
+        done, failed = [], []
+        for o in offers:
+            try:
+                stem = re.sub(r"[^A-Za-z0-9]+", "", o["name"]) or "font"
+                for i, url in enumerate(o["urls"]):
+                    ext = ".otf" if url.split("?")[0].lower().endswith(
+                        ".otf") else ".ttf"
+                    install_font_file(download_font(url),
+                                      f"{stem}-{i + 1}{ext}")
+                done.append(o["family"])
+            except Exception:
+                log("font install failed: " + traceback.format_exc())
+                failed.append(o["family"])
+        self.inbox.put({"type": "fonts_done", "ok": done, "failed": failed})
+
+    def _on_fonts_done(self, msg):
+        ok, failed = msg["ok"], msg["failed"]
+        if failed:
+            self.note("couldn't install: " + ", ".join(failed))
+        if not ok:
+            return
+        self._installed = self._font_set()
+        shown = [f for f in ok if f.lower() in self._installed]
+        for m in self.history:               # redraw earlier messages
+            want = m.get("font_want")
+            if want and want.lower() in self._installed:
+                m["font"] = want
+                m.pop("font_want", None)
+        for f in ok:                         # allow another try if it failed
+            self.font_warned.discard(f.lower())
+        self.font_tags.clear()
+        self.apply_settings()
+        if len(shown) == len(ok):
+            self.note("installed: " + ", ".join(ok))
+            return
+        from tkinter import messagebox
+        self.busy = True
+        try:
+            again = messagebox.askyesno(
+                "Study chat",
+                "Installed: " + ", ".join(ok) + "\n\nThis computer needs "
+                "the chat restarted before it can use them. Restart now?",
+                parent=self.root)
+        finally:
+            self.busy = False
+        if not again:
+            self.note("installed: " + ", ".join(ok) + " (restart the chat "
+                      "to see them)")
+            return
+        self._restart_app()
+
+    def _restart_app(self):
+        args = [sys.executable, os.path.abspath(__file__),
+                "--name", self.net.name, "--room", self.net.room,
+                "--online" if self.net.mode == "online" else "--lan"]
+        try:
+            subprocess.Popen(args)
+            self.root.destroy()
+        except Exception:
+            self.note("couldn't restart by itself; please close and reopen")
 
     def _handle_incoming(self, msg):
         if msg.get("type") == "summon":
@@ -2469,6 +2698,12 @@ class Overlay:
         if msg.get("type") == "gif_ready":
             self.send_gif(msg["data"])
             return
+        if msg.get("type") == "font_result":
+            self._on_font_result(msg)
+            return
+        if msg.get("type") == "fonts_done":
+            self._on_fonts_done(msg)
+            return
         if msg.get("type") == "update_done":
             self._on_update_done(str(msg.get("version", "")))
             return
@@ -2479,7 +2714,10 @@ class Overlay:
         msg["font"] = "".join(c for c in str(msg.get("font", ""))
                               if c.isprintable())[:60].strip()
         if msg["font"] and msg.get("uid") != self.net.uid:
-            msg["font"] = self._usable_font(msg["font"], msg["name"])
+            want = msg["font"]
+            msg["font"] = self._usable_font(want, msg["name"])
+            if not msg["font"]:
+                msg["font_want"] = want      # so it can be shown once installed
         self.presence.seen(msg, time.time())
         greet = JOIN_GREETINGS.get(msg["name"].strip().lower())
         if (greet and msg.get("type") == "join"
@@ -2526,8 +2764,11 @@ class Overlay:
         self._deliver(msg)
 
     def _deliver(self, msg):
+        self.seq += 1
+        msg["_n"] = self.seq                 # order it arrived in
         self.add(msg)
         if self.state == "active":
+            self.seen_upto = self.seq
             self.redraw()
         else:
             self.popup_until = time.time() + POPUP_SECONDS
