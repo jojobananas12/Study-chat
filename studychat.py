@@ -777,6 +777,7 @@ class SettingsWindow:
         self.ov.settings_win = None
         self.ov.busy = False
         self.win.destroy()
+        self.ov._focus_entry()
 
 
 # ------------------------------------------------------------------------ UI
@@ -802,11 +803,19 @@ class Overlay:
         self.last_activity = 0
         self.busy = False
         self.settings_win = None
+        self._focus_job = None
         self.known_tags = set()
         self.presence = Presence()
         self.last_ping = 0
 
-        root.overrideredirect(True)
+        if root.tk.call("tk", "windowingsystem") == "aqua":
+            # Aqua treats overrideredirect windows as non-activating and
+            # ignores their focus requests. Hide the title bar while keeping
+            # a normal window that macOS can give keyboard focus to.
+            root.tk.call("tk::unsupported::MacWindowStyle", "style",
+                         root._w, "document", ("noTitleBar",))
+        else:
+            root.overrideredirect(True)
         root.attributes("-topmost", True)
         root.configure(bg=BG)
 
@@ -867,6 +876,8 @@ class Overlay:
         self.entry.bind("<Return>", self._on_send)
         self.entry.bind("<Escape>", lambda e: self.set_state("collapsed"))
         self.entry.bind("<Key>", lambda e: self._touch())
+        self.entry.bind("<Button-1>", self._focus_entry)
+        self.entry.bind("<Map>", self._focus_entry)
         for seq in ("<Control-v>", "<Control-V>", "<Command-v>"):
             try:
                 self.entry.bind(seq, self._on_paste)
@@ -899,6 +910,9 @@ class Overlay:
         self.root.attributes("-alpha", alpha)
 
     def set_state(self, state):
+        if self._focus_job is not None:
+            self.root.after_cancel(self._focus_job)
+            self._focus_job = None
         self.state = state
         for w in (self.pill, self.header, self.text, self.entry_wrap):
             w.pack_forget()
@@ -917,7 +931,21 @@ class Overlay:
             self.redraw()
             self._touch()
             self.root.lift()
-            self.root.focus_force()
+            self._focus_entry()
+
+    def _focus_entry(self, _e=None):
+        """Restore typing after geometry and default mouse bindings finish."""
+        if self.state != "active" or self.busy:
+            return
+        self._touch()
+        if self._focus_job is not None:
+            self.root.after_cancel(self._focus_job)
+        self._focus_job = self.root.after_idle(self._restore_entry_focus)
+
+    def _restore_entry_focus(self):
+        self._focus_job = None
+        if (self.state == "active" and not self.busy
+                and self.entry.winfo_viewable()):
             self.entry.focus_force()
 
     def apply_settings(self):
@@ -972,11 +1000,17 @@ class Overlay:
     def show_who(self):
         self.note("Online: " + ", ".join(self.online_names()))
 
-    def _on_text_click(self, _e):
+    def _on_text_click(self, e):
+        if any(tag.startswith("img_") for tag in
+               self.text.tag_names(f"@{e.x},{e.y}")):
+            # The image tag opens a viewer; leave focus with that window.
+            return "break"
         if self.state != "active":
             self.set_state("active")
         else:
-            self.entry.focus_force()         # so Ctrl+V works after clicking
+            # Text's default click binding takes focus even when disabled.
+            # Restore it afterwards, retaining normal history selection.
+            self._focus_entry()
 
     def _touch(self):
         self.last_activity = time.time()
@@ -1028,9 +1062,16 @@ class Overlay:
         lbl = self.tk.Label(top, image=photo, bg=BG, cursor="hand2")
         lbl.image = photo
         lbl.pack()
+
+        def close(_e=None):
+            top.destroy()
+            self._focus_entry()
+            return "break"
+
         for w in (top, lbl):
-            w.bind("<Button-1>", lambda e: top.destroy())
-        top.bind("<Escape>", lambda e: top.destroy())
+            w.bind("<Button-1>", close)
+        top.bind("<Escape>", close)
+        top.protocol("WM_DELETE_WINDOW", close)
         top.focus_force()
 
     def push_image(self, data):
@@ -1097,7 +1138,7 @@ class Overlay:
         if path:
             self.send_file(path)
         self.root.lift()
-        self.entry.focus_force()
+        self._focus_entry()
 
     def _clip_has_text(self):
         try:
@@ -1344,8 +1385,8 @@ def main():
         except Exception:
             pass
 
-    root.deiconify()
     overlay = Overlay(root, net, inbox)
+    root.deiconify()                     # set the macOS style before mapping
     try:
         tkver = str(root.tk.call("info", "patchlevel"))
         log(f"started: python {sys.version.split()[0]}, tk {tkver}, "
