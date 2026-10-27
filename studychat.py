@@ -99,12 +99,8 @@ BAR = "#1d2029"          # top bar and text box color
 FG = "#e8e8e8"           # message text color
 MUTED = "#8a90a0"        # faded text color
 FONT_FAMILY = "Papyrus"
-<<<<<<< HEAD
 MY_FONT = ""             # font for YOUR messages (blank = use the one above)
 FONT_SIZE = 10
-=======
-FONT_SIZE = 14
->>>>>>> c81bc52b5f55c6703aa84612a7c26965ea76dd1f
 
 # --- Window
 WIDTH = 360
