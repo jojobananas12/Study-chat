@@ -95,7 +95,7 @@ except Exception:
 # ------------------------------------------------------------------ version
 # Bump VERSION whenever you publish a new studychat.py to GitHub. Everyone
 # running an older version is told, and can update with one click.
-VERSION = "1.0"
+VERSION = "1.1"
 UPDATE_REPO = "jojobananas12/Study-chat"     # github.com/<this>
 CHECK_UPDATES = os.environ.get("STUDYCHAT_NO_UPDATE") != "1"
 
@@ -671,6 +671,10 @@ class RelayNet:
         # the same internet address, so keep background chatter rare.
         self.ping_every = max(ONLINE_PING_EVERY, 180)
         self.cool_until = 0              # pause quiet signals after a 429
+        self.cool_n = 0                  # 429s in a row (longer pause each time)
+        self.deferred = {}               # quiet signals held back, to retry
+        self.join_ok = False             # our "joined" reached the relay
+        self.held_note = False           # told the person about a slow relay
         self.token = os.environ.get("STUDYCHAT_TOKEN")   # ntfy account
         self.base = RELAY_URL.rstrip("/")
         self.topic = "sc-" + hashlib.sha256(
@@ -712,18 +716,59 @@ class RelayNet:
         self.sendq.put((msg, data))
         return dict(msg, data=data)
 
+    # Quiet signals (joined, who's here, still here) are not chat, but they
+    # are how people see each other. If the relay is busy they used to be
+    # thrown away, so nobody ever appeared. Now they are held and retried,
+    # and a newer signal of the same kind replaces an older one.
+    HOLD_FOR = {"join": 300, "ping:keepalive": 600, "ping:who": 30,
+                "ping:roster": 30}
+
+    @staticmethod
+    def _key(msg):
+        t = msg.get("type")
+        if t == "ping":
+            return "ping:" + ("who" if msg.get("text") == "who" else
+                              "roster" if "roster" in msg else "keepalive")
+        return t
+
+    def _hold(self, msg, data, born, tries, fresh):
+        key = self._key(msg)
+        if key not in self.HOLD_FOR:
+            return                   # chat is never held
+        if key in self.deferred and not fresh:
+            return                   # a retry never replaces a newer signal
+        self.deferred.pop(key, None)
+        self.deferred[key] = (msg, data, born, tries)
+        if not self.held_note and key == "join":
+            self.held_note = True
+            log("join held back by the relay")
+            self._status("the chat server is busy, so others may not see "
+                         "you yet. Retrying...")
+
     def _sender(self):
         url = f"{self.base}/{self.topic}"
         while True:
-            msg, data = self.sendq.get()
+            from_queue = True
+            try:
+                msg, data = self.sendq.get(timeout=1)
+                born, tries = time.time(), 0
+            except queue.Empty:
+                # nothing new: retry a held-back signal once the relay allows
+                if not self.deferred or time.time() < self.cool_until:
+                    continue
+                key = next(iter(self.deferred))
+                msg, data, born, tries = self.deferred.pop(key)
+                from_queue = False
+                if time.time() - born > self.HOLD_FOR.get(key, 0):
+                    continue                     # too old to be useful
             quiet = (msg.get("type") in ("ping", "join", "leave")
                      and "items" not in msg     # history must not be dropped
                      and "flip" not in msg)
-            if quiet and msg.get("type") != "leave" \
-                    and time.time() < self.cool_until:
-                self.sendq.task_done()           # relay is angry: stay quiet
-                continue
             try:
+                if (quiet and msg.get("type") != "leave"
+                        and time.time() < self.cool_until):
+                    self._hold(msg, data, born, tries, from_queue)   # angry
+                    continue
                 meta = json.dumps(msg)           # one ASCII line
                 for attempt in range(4):
                     if data is None:
@@ -738,10 +783,19 @@ class RelayNet:
                                      "Message": meta})
                     try:
                         self._open(req, 60).read()
+                        self.cool_n = 0
+                        if msg.get("type") == "join":
+                            self.join_ok = True
+                            if self.held_note:
+                                self.held_note = False
+                                self._status("connected: others can see "
+                                             "you now")
                         break
                     except urllib.error.HTTPError as ex:
                         if ex.code == 429:
-                            self.cool_until = time.time() + 45
+                            self.cool_n += 1
+                            self.cool_until = time.time() + min(
+                                60, 15 * 2 ** (self.cool_n - 1))
                         if ex.code != 429 or quiet or attempt == 3:
                             raise
                         # the relay says slow down: wait, then try again
@@ -749,16 +803,22 @@ class RelayNet:
                             self._status("relay is busy, retrying...")
                         time.sleep(5 * (attempt + 1))
             except urllib.error.HTTPError as ex:
-                if not quiet:
+                if quiet and msg.get("type") != "leave" and tries < 8:
+                    self._hold(msg, data, born, tries + 1, from_queue)
+                elif not quiet:
                     self._status("relay is too busy, message not sent; "
                                  "try again in a minute" if ex.code == 429
                                  else f"message not sent (error {ex.code})")
             except Exception:
-                if not quiet:
+                if quiet and msg.get("type") != "leave" and tries < 8:
+                    self.cool_until = max(self.cool_until, time.time() + 5)
+                    self._hold(msg, data, born, tries + 1, from_queue)
+                elif not quiet:
                     self._status("message not sent (is the internet "
                                  "working?)")
             finally:
-                self.sendq.task_done()
+                if from_queue:
+                    self.sendq.task_done()
 
     def close(self):
         """Tell everyone we're leaving, and give it a moment to go out."""
@@ -1120,8 +1180,11 @@ class Overlay:
         self.font_warned = set()
         self.full_anims = []                # ...and in full-size viewers
         self.presence = Presence()
-        self.last_ping = 0
+        # Joining already says "I'm here", so the first "still here" signal
+        # waits a full interval (it used to go out at once, wasting a post).
+        self.last_ping = time.time()
         self.start_time = time.time()      # first-join roll call
+        self.first_peer_at = None
         self.ready_at = None
         self.roll_sent = 0
         self.roll_done = False
@@ -2482,23 +2545,40 @@ class Overlay:
                     "slowed the app down)")
                 self.presence.refresh_all(now)
                 self.last_ping = 0
-            # first-join roll call: ask who's here (again if nobody answered)
-            if self.ready_at is None and getattr(self.net, "connected", True):
+            # first-join roll call: our "joined" already asks everyone to
+            # answer, so only ask again if nobody has (and, online, only once
+            # the join has really reached the relay)
+            online = self.net.mode == "online"
+            if (self.ready_at is None and getattr(self.net, "connected", True)
+                    and getattr(self.net, "join_ok", True)):
                 self.ready_at = now
             if self.ready_at is not None and not self.roll_done:
                 waited = now - self.ready_at
-                alone = len(self.presence.peers) == 0
-                if (alone and self.roll_sent < (2 if self.net.mode == "online" else 3)
-                        and waited >= (0.3, 3.0, 8.0)[self.roll_sent]):
+                others = len(self.presence.peers)
+                ask_at = (6.0,) if online else (0.3, 3.0, 8.0)
+                if (others == 0 and self.roll_sent < len(ask_at)
+                        and waited >= ask_at[self.roll_sent]):
                     self.roll_sent += 1
                     self.net.send("who", kind="ping",
                                   extra={"hist_req": 1})
-                if waited > 3.5:
+                if others and self.first_peer_at is None:
+                    self.first_peer_at = now
+                if online:
+                    # a trip to the relay and back, plus the random delay
+                    # before people answer, takes several seconds. Show the
+                    # list shortly after the first answer, or give up at 12s.
+                    done = (waited > 12 or (self.first_peer_at is not None
+                                            and now - self.first_peer_at > 2))
+                else:
+                    done = waited > 3.5
+                if done:
                     self.roll_done = True
                     self.update_online()
                     self.show_who_popup()
-            if not self.roll_done and now - self.start_time > 15:
-                self.roll_done = True               # offline: stop waiting
+            # stop saying "checking..." eventually, whatever happens
+            if not self.roll_done and now - self.start_time > (
+                    120 if online else 15):
+                self.roll_done = True
                 self.update_online()
             # tell others we're still here, and notice when someone stops
             if now - self.last_ping > self.net.ping_every:
