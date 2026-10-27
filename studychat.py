@@ -28,7 +28,8 @@ School wifi:
     must pick the same mode. Online mode is NOT private, so use a long,
     hard-to-guess room name.
 
-Commands: /who (who's online), /update (check for a new version),
+Commands: /reels [link] (small Instagram window; needs pywebview),
+  /who (who's online), /update (check for a new version),
   /version, /settings, /img, /quit. The chat checks GitHub for a newer
   version when it starts; set STUDYCHAT_NO_UPDATE=1 to turn that off.
 
@@ -52,6 +53,7 @@ import io
 import json
 import os
 import queue
+import shutil
 import random
 import re
 import socket
@@ -59,6 +61,9 @@ import ssl
 import subprocess
 import sys
 import threading
+import webbrowser
+import importlib.util
+import urllib.parse
 import time
 import traceback
 import urllib.error
@@ -100,7 +105,7 @@ FG = "#e8e8e8"           # message text color
 MUTED = "#8a90a0"        # faded text color
 FONT_FAMILY = "Papyrus"
 MY_FONT = ""             # font for YOUR messages (blank = use the one above)
-FONT_SIZE = 14
+FONT_SIZE = 10
 
 # --- Window
 WIDTH = 360
@@ -1050,7 +1055,14 @@ class Overlay:
         self.settings_win = None
         self._focus_job = None
         self.font_tags = {}                 # text tag -> (family, bold, color)
+        try:
+            self.old_tk = str(root.tk.call("info", "patchlevel")
+                              ).startswith("8.5")
+        except Exception:
+            self.old_tk = False
         self.anims = []                     # animated GIFs now in the chat
+        self._installed = None              # fonts on this computer
+        self.font_warned = set()
         self.full_anims = []                # ...and in full-size viewers
         self.presence = Presence()
         self.last_ping = 0
@@ -1084,6 +1096,8 @@ class Overlay:
         self.menu = tk.Menu(root, tearoff=0)
         self.menu.add_command(label="Settings...",
                               command=self.open_settings)
+        self.menu.add_command(label="Instagram reels window",
+                              command=self.open_reels)
         self.menu.add_command(label="Check for updates",
                               command=self.update_cmd)
         self.menu.add_command(label="Quit", command=root.destroy)
@@ -1105,6 +1119,10 @@ class Overlay:
                                      fg=MUTED, cursor="hand2", font=F(-2))
         self.settings_lbl.pack(side="right", padx=6)
         self.settings_lbl.bind("<Button-1>", lambda e: self.open_settings())
+        self.reels_lbl = tk.Label(self.header, text="reels", bg=BAR,
+                                  fg=MUTED, cursor="hand2", font=F(-2))
+        self.reels_lbl.pack(side="right", padx=6)
+        self.reels_lbl.bind("<Button-1>", lambda e: self.open_reels())
         self.online_lbl = tk.Label(self.header, text="checking...", bg=BAR,
                                    fg=MUTED, cursor="hand2", font=F(-2))
         self.online_lbl.pack(side="right", padx=6)
@@ -1217,6 +1235,7 @@ class Overlay:
         self.title.config(bg=BAR, fg=MUTED, font=F(-2))
         self.close_lbl.config(bg=BAR, fg=MUTED, font=F(-1))
         self.settings_lbl.config(bg=BAR, fg=MUTED, font=F(-2))
+        self.reels_lbl.config(bg=BAR, fg=MUTED, font=F(-2))
         self.online_lbl.config(bg=BAR, fg=MUTED, font=F(-2))
         self.text.config(bg=BG, fg=FG, font=F())
         self.text.tag_config("sys", foreground=MUTED)
@@ -1247,6 +1266,44 @@ class Overlay:
             self.font_tags[tag] = (family, bold, color)
             self._config_tag(tag, family, bold, color)
         return tag
+
+    def open_reels(self, link=""):
+        """Small Instagram window (/reels, or the "reels" button)."""
+        url = reels_url(link)
+        if url is None:
+            self.note("use:  /reels  or  /reels https://www.instagram.com/...")
+            return
+        old = getattr(self, "reels_proc", None)
+        if old is not None and old.poll() is None:
+            old.terminate()                  # replace it (new link or retry)
+        exe = find_chromium()
+        if exe is not None:
+            # Chrome/Edge "app" mode: a bare phone-sized window that uses
+            # your normal browser profile, so you are already logged in to
+            # Instagram if you are in that browser. (No custom user agent
+            # here: it would change your whole browser, and Instagram
+            # switches to its phone layout at this width anyway.)
+            x = max(0, self.root.winfo_screenwidth() - 420)
+            cmd = [exe, f"--app={url}", "--window-size=390,720",
+                   f"--window-position={x},40"]
+            note = ""
+        elif importlib.util.find_spec("webview") is not None:
+            cmd = [sys.executable, os.path.abspath(__file__), "--reels", url]
+            note = ("this small window can't use your browser's logins, so "
+                    "log in to Instagram once in it")
+        else:                                # nothing small is possible
+            webbrowser.open(url)
+            self.note("opened in your normal browser (so you're logged in). "
+                      "For a small phone-sized window, install Chrome, Edge "
+                      "or Brave.")
+            return
+        try:
+            self.reels_proc = subprocess.Popen(cmd)
+            if note:
+                self.note(note)
+        except Exception:
+            log("reels start failed: " + traceback.format_exc())
+            self.note("couldn't open the reels window")
 
     def open_settings(self):
         if self.settings_win is not None:
@@ -1641,37 +1698,61 @@ class Overlay:
         self.root.lift()
         self._focus_entry()
 
-    def _clip_has_text(self):
+    def _clip_text(self):
         try:
-            return bool(self.root.clipboard_get())
+            return self.root.clipboard_get() or ""
         except Exception:
-            return False
+            return ""
+
+    def _paste_text(self, text):
+        """Put text into the typing box ourselves, instead of letting Tk do
+        it. Old Macs crash on some characters (emoji) when Tk pastes them."""
+        text = re.sub(r"[\r\n\t]+", " ", text)
+        text = "".join(c for c in text if c.isprintable())[:1000]
+        if self.old_tk:
+            text = bmp(text)
+        if not text:
+            return
+        try:
+            self.entry.delete("sel.first", "sel.last")   # replace selection
+        except Exception:
+            pass
+        self.entry.insert("insert", text)
 
     def _on_paste(self, _e=None):
-        if not PIL_OK:
-            if self._clip_has_text():
-                return None                  # normal text paste
-            self.note("to paste images, run:  python -m pip install pillow  "
-                      "then restart the app")
-            return "break"
-        err = None
         try:
-            clip = ImageGrab.grabclipboard()
-        except Exception as ex:
-            clip, err = None, str(ex)[:80]
-        if clip is None:
-            if self._clip_has_text():
-                return None                  # normal text paste
-            self.note("no image found on the clipboard"
-                      + (f" ({err})" if err else ""))
-            return "break"
-        if isinstance(clip, list):           # copied image files
-            sent = False
-            for p in clip[:3]:
-                sent = self.send_file(p) or sent
-            return "break" if sent else None
-        self.send_pil(clip)
-        return "break"
+            # Text first: it's instant, and it never starts another program
+            # (the image check below does, and that can upset a Mac).
+            text = self._clip_text()
+            if text.strip():
+                path = text.strip().strip('"').strip("'")
+                if ("\n" not in path and os.path.isfile(path) and
+                        path.lower().endswith((".png", ".jpg", ".jpeg", ".gif",
+                                               ".bmp", ".webp"))):
+                    self.send_file(path)         # a copied image file
+                else:
+                    self._paste_text(text)
+                return "break"
+            if not PIL_OK:
+                self.note("to paste images, run:  python -m pip install "
+                          "pillow  then restart the app")
+                return "break"
+            err = None
+            try:
+                clip = ImageGrab.grabclipboard()
+            except Exception as ex:
+                clip, err = None, str(ex)[:80]
+            if clip is None:
+                self.note("no image found on the clipboard"
+                          + (f" ({err})" if err else ""))
+            elif isinstance(clip, list):         # copied image files
+                for p in clip[:3]:
+                    self.send_file(p)
+            else:
+                self.send_pil(clip)
+        except Exception:
+            log("paste failed: " + traceback.format_exc())
+        return "break"                           # we handled it, always
 
     # ---- content
     def _on_error(self, exc, val, tb):
@@ -1775,6 +1856,9 @@ class Overlay:
         if text.startswith("/img "):
             self.send_file(text[5:])
             return
+        if text == "/reels" or text.startswith("/reels "):
+            self.open_reels(text[6:])
+            return
         if text.startswith("/gif "):
             self.send_gif_link(text[5:].strip())
             return
@@ -1802,6 +1886,26 @@ class Overlay:
         finally:
             self.root.after(100, self.poll)
 
+    def _usable_font(self, family, who):
+        """The font to draw someone's message in. If it isn't installed on
+        this computer, use our normal font and say so once."""
+        if self._installed is None:
+            try:
+                from tkinter import font as tkfont
+                self._installed = {f.lower() for f in
+                                   tkfont.families(self.root)}
+            except Exception:
+                self._installed = set()
+        if not self._installed or family.lower() in self._installed:
+            return family
+        if (who, family.lower()) not in self.font_warned:
+            self.font_warned.add((who, family.lower()))
+            self.add({"type": "sys", "name": "", "text":
+                      f"{who} uses the font \"{family}\", which isn't "
+                      "installed on this computer, so you see the normal "
+                      "font."})
+        return ""
+
     def _handle_incoming(self, msg):
         if msg.get("type") == "summon":
             self.set_state("active")
@@ -1825,7 +1929,10 @@ class Overlay:
             return
         msg["name"] = str(msg.get("name", "?"))[:20]
         msg["text"] = str(msg.get("text", ""))[:2000]
-        msg["font"] = re.sub(r"[^\w .\-]", "", str(msg.get("font", "")))[:40].strip()
+        msg["font"] = "".join(c for c in str(msg.get("font", ""))
+                              if c.isprintable())[:60].strip()
+        if msg["font"] and msg.get("uid") != self.net.uid:
+            msg["font"] = self._usable_font(msg["font"], msg["name"])
         self.presence.seen(msg, time.time())
         roster = msg.get("roster")
         if (msg.get("type") == "ping" and isinstance(roster, list)
@@ -1907,6 +2014,121 @@ class Overlay:
             self.root.after(500, self.tick)
 
 
+# --------------------------------------------------------------------- reels
+REELS_HOME = "https://www.instagram.com/reels/"
+REELS_UA = ("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+            "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 "
+            "Mobile/15E148 Safari/604.1")
+
+
+def reels_url(text):
+    """A safe Instagram address to open, or None if it isn't Instagram."""
+    text = (text or "").strip()
+    if not text:
+        return REELS_HOME
+    try:
+        u = urllib.parse.urlparse(text)
+    except ValueError:
+        return None
+    host = (u.hostname or "").lower()
+    if u.scheme in ("http", "https") and (
+            host == "instagram.com" or host.endswith(".instagram.com")):
+        return text
+    return None
+
+
+def default_browser_hint():
+    """'chrome', 'edge' or 'brave' if that is the computer's default
+    browser, else ''. Best effort; any problem just means ''."""
+    raw = ""
+    try:
+        if sys.platform == "win32":
+            import winreg
+            key = winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                r"Software\Microsoft\Windows\Shell\Associations"
+                r"\UrlAssociations\https\UserChoice")
+            raw = str(winreg.QueryValueEx(key, "ProgId")[0])
+        elif sys.platform == "darwin":
+            import plistlib
+            path = os.path.join(
+                os.path.expanduser("~"), "Library", "Preferences",
+                "com.apple.LaunchServices",
+                "com.apple.launchservices.secure.plist")
+            with open(path, "rb") as f:
+                for h in plistlib.load(f).get("LSHandlers", []):
+                    if h.get("LSHandlerURLScheme") == "https":
+                        raw = str(h.get("LSHandlerRoleAll", ""))
+                        break
+        else:
+            raw = subprocess.run(["xdg-settings", "get",
+                                  "default-web-browser"],
+                                 capture_output=True, text=True,
+                                 timeout=3).stdout
+    except Exception:
+        return ""
+    raw = raw.lower()
+    for hint, words in (("chrome", ("chrome",)), ("edge", ("edge", "msedge")),
+                        ("brave", ("brave",))):
+        if any(w in raw for w in words):
+            return hint
+    return ""
+
+
+def find_chromium():
+    """Path to Chrome, Edge or Brave, if one is installed. The computer's
+    default browser comes first, since that is the one you most likely
+    stay logged in to Instagram on."""
+    env = os.environ
+    cands = []                                   # (which, path)
+    if sys.platform == "win32":
+        for base in (env.get("ProgramFiles"), env.get("ProgramFiles(x86)"),
+                     env.get("LocalAppData")):
+            if base:
+                cands += [
+                    ("edge", os.path.join(base, "Microsoft", "Edge",
+                                          "Application", "msedge.exe")),
+                    ("chrome", os.path.join(base, "Google", "Chrome",
+                                            "Application", "chrome.exe")),
+                    ("brave", os.path.join(base, "BraveSoftware",
+                                           "Brave-Browser", "Application",
+                                           "brave.exe"))]
+    elif sys.platform == "darwin":
+        for hint, app in (("chrome", "Google Chrome"),
+                          ("edge", "Microsoft Edge"),
+                          ("brave", "Brave Browser")):
+            cands.append((hint, f"/Applications/{app}.app/Contents/MacOS/"
+                                f"{app}"))
+    for name, hint in (("google-chrome", "chrome"), ("chromium", "chrome"),
+                       ("chromium-browser", "chrome"),
+                       ("microsoft-edge", "edge"),
+                       ("brave-browser", "brave")):
+        p = shutil.which(name)
+        if p:
+            cands.append((hint, p))
+    cands = [c for c in cands if os.path.isfile(c[1])]
+    want = default_browser_hint()
+    cands.sort(key=lambda c: c[0] != want)       # stable: default first
+    return cands[0][1] if cands else None
+
+
+def run_reels(url):
+    """A small always-on-top browser window for Instagram (own process, since
+    pywebview wants to run on its own main thread). Needs: pip install
+    pywebview. You log in once; it remembers you."""
+    import webview
+    webview.create_window("Reels", url, width=390, height=720, on_top=True)
+    storage = os.path.join(os.path.expanduser("~"), ".studychat_web")
+    for kw in ({"private_mode": False, "storage_path": storage,
+                "user_agent": REELS_UA},
+               {"private_mode": False, "storage_path": storage}, {}):
+        try:
+            webview.start(**kw)          # older pywebview: fewer options
+            return
+        except TypeError:
+            continue
+
+
 def main():
     import tkinter as tk
     from tkinter import simpledialog
@@ -1920,7 +2142,15 @@ def main():
                     help="use the internet relay (works on school wifi)")
     ap.add_argument("--lan", action="store_true",
                     help="same-wifi mode (needs a network that allows it)")
+    ap.add_argument("--reels", nargs="?", const=REELS_HOME,
+                    help="open just the small Instagram window")
     args = ap.parse_args()
+    if args.reels is not None:
+        try:
+            run_reels(reels_url(args.reels) or REELS_HOME)
+        except Exception:
+            log("reels window failed: " + traceback.format_exc())
+        return
 
     root = tk.Tk()
     root.withdraw()
@@ -1979,6 +2209,9 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        proc = getattr(overlay, "reels_proc", None)
+        if proc is not None and proc.poll() is None:
+            proc.terminate()             # close the reels window too
         net.close()                      # sends "left" to everyone
 
 
