@@ -34,7 +34,8 @@ School wifi:
     hard-to-guess room name.
 
 Commands: /reels [link] (small Instagram window; needs Chrome, Chromium,
-  Edge or Brave, or pywebview),
+  Edge or Brave, or pywebview), /reelgif (send a GIF of the reel; same as
+  the "gif" button, "/reelgif area" picks the screen area again),
   /who (who's online), /update (check for a new version),
   /version, /settings, /img, /quit. The chat checks GitHub for a newer
   version when it starts; set STUDYCHAT_NO_UPDATE=1 to turn that off.
@@ -133,6 +134,9 @@ DEFAULT_ROOM = "study"   # pre-filled in the "Room name" box
 THUMB_W, THUMB_H = 280, 180
 MAX_IMAGE_MB = 8         # biggest image allowed, in megabytes
 SEND_MAX_DIM = 1600      # big images are shrunk to this many pixels first
+GIF_SECONDS = 4          # length of a "gif of the reel" recording
+GIF_FPS = 8              # frames per second of that recording
+GIF_WIDTH = 300          # width (pixels) of that GIF
 
 # --- Network (these need a restart)
 PORT = 50555             # same-wifi mode (everyone must match)
@@ -178,6 +182,9 @@ SPEC = [
     ("Images", "THUMB_H", "Thumbnail height", "int", 40, 800),
     ("Images", "MAX_IMAGE_MB", "Biggest image allowed (MB)", "int", 1, 15),
     ("Images", "SEND_MAX_DIM", "Shrink big images to (pixels)", "int", 300, 4000),
+    ("Images", "GIF_SECONDS", "Reel GIF length (seconds)", "int", 1, 8),
+    ("Images", "GIF_FPS", "Reel GIF frames per second", "int", 3, 12),
+    ("Images", "GIF_WIDTH", "Reel GIF width (pixels)", "int", 120, 640),
     ("Network", "PORT", "Same-wifi port", "int", 1024, 65535),
     ("Network", "RELAY_URL", "Online relay address", "str", 8, 200),
     ("Network", "WIFI_PING_EVERY", "Wifi 'still here' signal (seconds)",
@@ -1062,6 +1069,7 @@ class Overlay:
         self.settings_win = None
         self._focus_job = None
         self.font_tags = {}                 # text tag -> (family, bold, color)
+        self.color_tags = set()             # name-color tags already made
         try:
             self.old_tk = str(root.tk.call("info", "patchlevel")
                               ).startswith("8.5")
@@ -1083,6 +1091,9 @@ class Overlay:
         self.hist_seq = 0                  # late-joiner history
         self.last_hist = 0
         self.hist_from = None
+        self.clip_box = None               # screen area of the reels window
+        self.clipping = False
+        self.wayland_warned = False
 
         if root.tk.call("tk", "windowingsystem") == "aqua":
             # Aqua treats overrideredirect windows as non-activating and
@@ -1115,6 +1126,10 @@ class Overlay:
                               command=self.open_settings)
         self.menu.add_command(label="Instagram reels window",
                               command=self.open_reels)
+        self.menu.add_command(label="Send GIF of the reel",
+                              command=self.clip_reel)
+        self.menu.add_command(label="Pick the reel area again",
+                              command=lambda: self.clip_reel(True))
         self.menu.add_command(label="Check for updates",
                               command=self.update_cmd)
         self.menu.add_command(label="Quit", command=root.destroy)
@@ -1140,6 +1155,12 @@ class Overlay:
                                   fg=MUTED, cursor="hand2", font=F(-2))
         self.reels_lbl.pack(side="right", padx=6)
         self.reels_lbl.bind("<Button-1>", lambda e: self.open_reels())
+        self.clip_lbl = tk.Label(self.header, text="gif", bg=BAR,
+                                 fg=MUTED, cursor="hand2", font=F(-2))
+        self.clip_lbl.pack(side="right", padx=6)
+        self.clip_lbl.bind("<Button-1>", lambda e: self.clip_reel())
+        for b in ("<Button-2>", "<Button-3>"):      # right-click: new area
+            self.clip_lbl.bind(b, lambda e: self.clip_reel(True))
         self.online_lbl = tk.Label(self.header, text="checking...", bg=BAR,
                                    fg=MUTED, cursor="hand2", font=F(-2))
         self.online_lbl.pack(side="right", padx=6)
@@ -1253,6 +1274,7 @@ class Overlay:
         self.close_lbl.config(bg=BAR, fg=MUTED, font=F(-1))
         self.settings_lbl.config(bg=BAR, fg=MUTED, font=F(-2))
         self.reels_lbl.config(bg=BAR, fg=MUTED, font=F(-2))
+        self.clip_lbl.config(bg=BAR, fg=MUTED, font=F(-2))
         self.online_lbl.config(bg=BAR, fg=MUTED, font=F(-2))
         self.text.config(bg=BG, fg=FG, font=F())
         self.text.tag_config("sys", foreground=MUTED)
@@ -1274,7 +1296,22 @@ class Overlay:
         opts = {"font": font}
         if color:
             opts["foreground"] = color
-        self.text.tag_config(tag, **opts)
+        try:
+            self.text.tag_config(tag, **opts)
+        except self.tk.TclError:             # odd font: keep the rest
+            log("tag font failed: " + traceback.format_exc())
+            opts.pop("font", None)
+            if opts:
+                self.text.tag_config(tag, **opts)
+
+    def _color_tag(self, color):
+        """A tag that only sets a text color (kept apart from the font tag,
+        so a font problem on one computer can never turn names white)."""
+        tag = "col_" + color.lstrip("#")
+        if tag not in self.color_tags:
+            self.text.tag_config(tag, foreground=color)
+            self.color_tags.add(tag)         # only after it really worked
+        return tag
 
     def _font_tag(self, family, bold=False, color=None, name=""):
         """A text tag that draws in one person's chosen font."""
@@ -1323,6 +1360,159 @@ class Overlay:
         except Exception:
             log("reels start failed: " + traceback.format_exc())
             self.note("couldn't open the reels window")
+
+    # ---- GIF of the reel (a short screen recording of the reels window)
+    def pick_clip_area(self, then=None):
+        """Dim the screen and let the person drag a box around the reel."""
+        tk = self.tk
+        self.busy = True
+        sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        top = tk.Toplevel(self.root)
+        top.configure(bg="black")
+        if self.root.tk.call("tk", "windowingsystem") == "aqua":
+            top.attributes("-fullscreen", True)
+        else:
+            top.overrideredirect(True)
+            top.geometry(f"{sw}x{sh}+0+0")
+        try:
+            top.attributes("-alpha", 0.3)
+        except Exception:
+            pass
+        top.attributes("-topmost", True)
+        cv = tk.Canvas(top, bg="black", highlightthickness=0,
+                       cursor="crosshair")
+        cv.pack(fill="both", expand=True)
+        cv.create_text(sw // 2, 60, fill="white", font=F(4, True),
+                       text="Drag a box around the reel window.  "
+                            "Right-click or Esc to cancel.")
+        st = {}
+
+        def close(_e=None):
+            try:
+                top.destroy()
+            except Exception:
+                pass
+            self.busy = self.settings_win is not None
+            self._touch()
+            return "break"
+
+        def down(e):
+            st["x0"], st["y0"] = e.x_root, e.y_root
+            st["r"] = cv.create_rectangle(e.x, e.y, e.x, e.y, width=3,
+                                          outline="#7be08a")
+
+        def move(e):
+            if "r" in st:
+                cv.coords(st["r"], st["x0"] - top.winfo_rootx(),
+                          st["y0"] - top.winfo_rooty(), e.x, e.y)
+
+        def up(e):
+            if "x0" not in st:
+                return
+            x0, y0, x1, y1 = st["x0"], st["y0"], e.x_root, e.y_root
+            close()
+            box = (min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1))
+            if box[2] - box[0] < 60 or box[3] - box[1] < 60:
+                self.note("that box was too small, try again")
+                return
+            self.clip_box = box
+            if then is not None:         # let the dim layer vanish first
+                self.root.after(300, then)
+
+        cv.bind("<ButtonPress-1>", down)
+        cv.bind("<B1-Motion>", move)
+        cv.bind("<ButtonRelease-1>", up)
+        for b in ("<Button-2>", "<Button-3>"):
+            cv.bind(b, close)
+        top.bind("<Escape>", close)
+        top.focus_force()
+
+    def clip_reel(self, reselect=False):
+        """The "gif" button: record a few seconds of the reels window and
+        send it to the chat as a GIF."""
+        if not PIL_OK:
+            self.note("GIFs of the reel need Pillow:  python -m pip install "
+                      "pillow  then restart the app")
+            return
+        if self.clipping:
+            self.note("already recording...")
+            return
+        if self.clip_box is None or reselect:
+            self.pick_clip_area(then=self.clip_reel)
+            return
+        if (sys.platform.startswith("linux") and not self.wayland_warned
+                and os.environ.get("XDG_SESSION_TYPE", "").lower()
+                == "wayland"):
+            self.wayland_warned = True
+            self.note("heads up: Wayland desktops often block screen "
+                      "capture, so the GIF may come out black. Logging in "
+                      "with an X11 session fixes that.")
+        scale = 1.0
+        if sys.platform == "win32":          # Windows display scaling
+            try:
+                scale = (ImageGrab.grab().width
+                         / max(1, self.root.winfo_screenwidth()))
+            except Exception:
+                pass
+        bbox = tuple(int(round(v * scale)) for v in self.clip_box)
+        self.clipping = True
+        self.note(f"recording {GIF_SECONDS} seconds of the reel...")
+        threading.Thread(target=self._clip_worker,
+                         args=(bbox, GIF_SECONDS, GIF_FPS, GIF_WIDTH),
+                         daemon=True).start()
+
+    def _clip_worker(self, bbox, seconds, fps, width):
+        def say(text):
+            self.inbox.put({"type": "sys", "name": "", "text": text})
+        try:
+            frames, gap = [], 1.0 / fps
+            t0 = time.time()
+            nxt = t0
+            while time.time() - t0 < seconds:
+                try:
+                    frames.append(ImageGrab.grab(bbox=bbox,
+                                                 all_screens=True))
+                except TypeError:            # older Pillow
+                    frames.append(ImageGrab.grab(bbox=bbox))
+                nxt += gap
+                wait = nxt - time.time()
+                if wait > 0:
+                    time.sleep(wait)
+            elapsed = time.time() - t0
+            if len(frames) < 2:
+                say("couldn't record the reel (screen capture too slow)")
+                return
+            if frames[0].convert("RGB").getextrema() == ((0, 0),) * 3:
+                say("the recording came out black: your system is blocking "
+                    "screen capture (on a Mac, allow Screen Recording for "
+                    "Python in System Settings; on Linux, use an X11 "
+                    "session)")
+                return
+            dur = max(20, int(elapsed / len(frames) * 1000))
+            w, h = frames[0].size
+            nw = min(width, w)
+            nh = max(16, int(h * nw / w))
+            small = [f.convert("RGB").resize((nw, nh)) for f in frames]
+            data = None
+            for sc in (1.0, 0.8, 0.6, 0.45):
+                size = (max(16, int(nw * sc)), max(16, int(nh * sc)))
+                fr = small if sc == 1.0 else [s.resize(size) for s in small]
+                buf = io.BytesIO()
+                fr[0].save(buf, "GIF", save_all=True, append_images=fr[1:],
+                           duration=dur, loop=0, optimize=True)
+                if buf.tell() <= MAX_IMAGE_BYTES:
+                    data = buf.getvalue()
+                    break
+            if data is None:
+                say("that GIF came out too big to send; try a shorter or "
+                    "narrower one in Settings")
+                return
+            self.inbox.put({"type": "gif_ready", "data": data})
+        except Exception:
+            log("reel gif failed: " + traceback.format_exc())
+            say("couldn't record the reel (screen capture failed)")
+        finally:
+            self.clipping = False
 
     def open_settings(self):
         if self.settings_win is not None:
@@ -1409,7 +1599,9 @@ class Overlay:
                 continue
             it = {"id": m["id"], "name": m.get("name", "?"),
                   "text": m["text"][:400], "uid": m.get("uid") or "",
-                  "font": m.get("font") or ""}
+                  "font": m.get("font") or "",
+                  "color": m.get("color")
+                  or name_color(str(m.get("name", "?")))}
             size = len(json.dumps(it)) + 2
             if size > chunk_cap:
                 continue
@@ -1462,7 +1654,10 @@ class Overlay:
                            if c.isprintable())[:60].strip()
             if font:
                 font = self._usable_font(font, name)
-            m = {"type": "msg", "id": mid, "name": name,
+            col = str(it.get("color") or "").lower()
+            if not re.fullmatch(r"#[0-9a-f]{6}", col):
+                col = ""
+            m = {"type": "msg", "id": mid, "name": name, "color": col,
                  "text": str(it.get("text", ""))[:2000], "font": font,
                  "uid": it.get("uid") if isinstance(it.get("uid"), str)
                  else "", "_old": True, "_hk": k}
@@ -1924,9 +2119,16 @@ class Overlay:
                 fam = MY_FONT or FONT_FAMILY
             else:                                 # theirs: the font they chose
                 fam = m.get("font") or FONT_FAMILY
-            tag = self._font_tag(fam, True, name_color(m["name"]), m["name"])
+            # The sender's own color, so everyone sees the same one. (Old
+            # versions don't send it, so fall back to the name's color.)
+            col = str(m.get("color") or "").lower()
+            if not re.fullmatch(r"#[0-9a-f]{6}", col):
+                col = name_color(m["name"])
+            tag = self._font_tag(fam, True, None, m["name"])
             ttag = self._font_tag(fam)
-            t.insert("end", m["name"] + ": ", tag)
+            ctag = self._color_tag(col)
+            t.insert("end", m["name"] + ": ", (tag, ctag))
+            t.tag_raise(ctag)
             if kind == "img" and isinstance(m.get("data"), bytes):
                 if id(m) in live and "_anim" not in m:
                     m["_anim"] = self.make_anim(m["data"], THUMB_W, THUMB_H)
@@ -1983,14 +2185,19 @@ class Overlay:
         if text.startswith("/img "):
             self.send_file(text[5:])
             return
+        if text in ("/reelgif", "/reelgif area"):
+            self.clip_reel(text.endswith("area"))
+            return
         if text == "/reels" or text.startswith("/reels "):
             self.open_reels(text[6:])
             return
         if text.startswith("/gif "):
             self.send_gif_link(text[5:].strip())
             return
-        self.add(self.net.send(text, extra={"font": MY_FONT}
-                               if MY_FONT else None))
+        extra = {"color": name_color(self.net.name)}
+        if MY_FONT:
+            extra["font"] = MY_FONT
+        self.add(self.net.send(text, extra=extra))
         self.last_ping = time.time()        # a message already says "here"
         self.redraw()
 
@@ -2056,6 +2263,8 @@ class Overlay:
             return
         msg["name"] = str(msg.get("name", "?"))[:20]
         msg["text"] = str(msg.get("text", ""))[:2000]
+        col = str(msg.get("color") or "").lower()
+        msg["color"] = col if re.fullmatch(r"#[0-9a-f]{6}", col) else ""
         msg["font"] = "".join(c for c in str(msg.get("font", ""))
                               if c.isprintable())[:60].strip()
         if msg["font"] and msg.get("uid") != self.net.uid:
