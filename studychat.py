@@ -38,6 +38,9 @@ School wifi:
     must pick the same mode. Online mode is NOT private, so use a long,
     hard-to-guess room name.
 
+Links in messages are clickable (Instagram links open the small reels
+  window). Select chat text with the mouse and press Ctrl+C (Cmd+C on a
+  Mac) to copy it, or right-click a line or link for a copy menu.
 Commands: /getfonts (install the free fonts your friends use),
   /reels [link] (small Instagram window; needs Chrome, Chromium,
   Edge or Brave, or pywebview), /reelgif (send a GIF of the reel; same as
@@ -96,7 +99,7 @@ except Exception:
 # ------------------------------------------------------------------ version
 # Bump VERSION whenever you publish a new studychat.py to GitHub. Everyone
 # running an older version is told, and can update with one click.
-VERSION = "1.3"
+VERSION = "1.4"
 UPDATE_REPO = "jojobananas12/Study-chat"     # github.com/<this>
 CHECK_UPDATES = os.environ.get("STUDYCHAT_NO_UPDATE") != "1"
 
@@ -298,6 +301,37 @@ for _a, _b in zip(".,'?!()[]{}<>&_;", ["˙", "'", ",", "¿", "¡", ")", "(", "]"
                                       "[", "}", "{", ">", "<", "⅋", "‾",
                                       "؛"]):
     _FLIP[_a] = _b
+
+
+URL_RE = re.compile(r"(?:https?://|www\.)[^\s<>\"']+", re.I)
+LINK_COLOR = "#6cb6ff"
+
+
+def split_links(text):
+    """Cut a message into [(piece, url or None), ...] so links can be made
+    clickable. Trailing punctuation (a full stop, a closing bracket) is left
+    out of the link."""
+    out, pos = [], 0
+    for m in URL_RE.finditer(text):
+        raw = m.group()
+        while raw and (raw[-1] in ".,;:!?'\"]}" or (
+                raw[-1] == ")" and raw.count(")") > raw.count("("))):
+            raw = raw[:-1]
+        url = raw if raw.lower().startswith("http") else "https://" + raw
+        try:
+            u = urllib.parse.urlparse(url)
+            good = u.scheme in ("http", "https") and "." in (u.hostname or "")
+        except ValueError:
+            good = False
+        if not good:
+            continue
+        if m.start() > pos:
+            out.append((text[pos:m.start()], None))
+        out.append((raw, url))
+        pos = m.start() + len(raw)
+    if pos < len(text):
+        out.append((text[pos:], None))
+    return out
 
 
 def flip_text(s):
@@ -1383,7 +1417,12 @@ class Overlay:
                             wrap="word", font=F(), padx=6, pady=4,
                             state="disabled", cursor="arrow")
         self.text.tag_config("sys", foreground=MUTED)
+        self.text.tag_config("link", foreground=LINK_COLOR, underline=True)
+        self.link_urls = {}                 # link tag -> address
         self.text.bind("<Button-1>", self._on_text_click)
+        self.text.bind("<<Copy>>", self._on_copy)
+        for b in ("<Button-3>", "<Button-2>", "<Control-Button-1>"):
+            self.text.bind(b, self._text_menu)
 
         self.entry_wrap = tk.Frame(root, bg=BAR)
         self.plus = tk.Label(self.entry_wrap, text="+", bg=BAR, fg=FG,
@@ -1394,6 +1433,7 @@ class Overlay:
                               insertbackground=FG, font=F(),
                               highlightthickness=0)
         self.entry.pack(side="left", fill="x", expand=True, padx=6, pady=5)
+        self.entry.bind("<<Copy>>", self._on_copy)   # copy chat text too
         self.entry.bind("<Return>", self._on_send)
         self.entry.bind("<Escape>", lambda e: self.set_state("collapsed"))
         self.entry.bind("<Key>", lambda e: self._touch())
@@ -1541,6 +1581,7 @@ class Overlay:
         self.online_lbl.config(bg=BAR, fg=MUTED, font=F(-2))
         self.text.config(bg=BG, fg=FG, font=F())
         self.text.tag_config("sys", foreground=MUTED)
+        self.text.tag_config("link", foreground=LINK_COLOR, underline=True)
         self.entry_wrap.config(bg=BAR)
         self.plus.config(bg=BAR, fg=FG, font=F(3, True))
         self.entry.config(bg=BAR, fg=FG, insertbackground=FG, font=F())
@@ -2065,16 +2106,97 @@ class Overlay:
                        "Online: " + ", ".join(self.online_names())})
 
     def _on_text_click(self, e):
-        if any(tag.startswith("img_") for tag in
-               self.text.tag_names(f"@{e.x},{e.y}")):
+        names = self.text.tag_names(f"@{e.x},{e.y}")
+        if any(tag.startswith("img_") for tag in names):
             # The image tag opens a viewer; leave focus with that window.
             return "break"
+        if self.state != "active" and any(
+                tag.startswith("lnk_") for tag in names):
+            return "break"           # a link: open it, don't open the chat
         if self.state != "active":
             self.set_state("active")
         else:
             # Text's default click binding takes focus even when disabled.
             # Restore it afterwards, retaining normal history selection.
             self._focus_entry()
+
+    def _link_at(self, index):
+        for tag in self.text.tag_names(index):
+            if tag in self.link_urls:
+                return self.link_urls[tag]
+        return None
+
+    def open_link(self, url):
+        try:
+            host = (urllib.parse.urlparse(url).hostname or "").lower()
+            if host == "instagram.com" or host.endswith(".instagram.com"):
+                self.open_reels(url)         # the small reels window
+            else:
+                webbrowser.open(url)
+        except Exception:
+            log("open link failed: " + traceback.format_exc())
+            self.note("couldn't open that link")
+
+    def _link_release(self, url):
+        if self.text.tag_ranges("sel"):      # they were selecting, not clicking
+            return None
+        self.open_link(url)
+        return "break"
+
+    def _copy_text(self, text):
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+        except Exception:
+            self.note("couldn't copy")
+
+    def _selected_chat_text(self):
+        try:
+            return self.text.get("sel.first", "sel.last")
+        except Exception:
+            return ""
+
+    def _on_copy(self, _e=None):
+        """Ctrl/Cmd+C: copy what's selected in the chat. (Typing-box text
+        still copies the normal way.)"""
+        try:
+            if self.entry.selection_present():
+                return None
+        except Exception:
+            pass
+        sel = self._selected_chat_text()
+        if sel:
+            self._copy_text(sel)
+            return "break"
+        return None
+
+    def _text_menu(self, e):
+        idx = self.text.index(f"@{e.x},{e.y}")
+        url = self._link_at(idx)
+        sel = self._selected_chat_text()
+        line = self.text.get(f"{idx} linestart", f"{idx} lineend").strip()
+        menu = self.tk.Menu(self.root, tearoff=0)
+        if url:
+            menu.add_command(label="Open link",
+                             command=lambda: self.open_link(url))
+            menu.add_command(label="Copy link",
+                             command=lambda: self._copy_text(url))
+        if sel:
+            menu.add_command(label="Copy",
+                             command=lambda: self._copy_text(sel))
+        if line:
+            menu.add_command(label="Copy this line",
+                             command=lambda: self._copy_text(line))
+        if menu.index("end") is None:
+            return "break"
+        self.busy = True                     # keep the chat open meanwhile
+        try:
+            menu.tk_popup(e.x_root, e.y_root)
+        finally:
+            menu.grab_release()
+            self.busy = self.settings_win is not None
+            self._touch()
+        return "break"
 
     def _touch(self):
         self.last_activity = time.time()
@@ -2406,6 +2528,8 @@ class Overlay:
         for m in gifs:
             if id(m) not in live:
                 m.pop("_anim", None)
+        self.link_urls = {}
+        nlink = 0
         prev_old = False
         upside = time.time() < self.flip_until
         fx = flip_text if upside else str
@@ -2467,8 +2591,24 @@ class Overlay:
                 else:
                     t.insert("end", "(image couldn't be shown)", "sys")
                 t.insert("end", "\n")
-            else:
+            elif upside:
                 t.insert("end", fx(m.get("text", "")) + "\n", ttag)
+            else:
+                for piece, url in split_links(m.get("text", "")):
+                    if url is None:
+                        t.insert("end", piece, ttag)
+                        continue
+                    lt = f"lnk_{nlink}"
+                    nlink += 1
+                    self.link_urls[lt] = url
+                    t.insert("end", piece, (ttag, "link", lt))
+                    t.tag_bind(lt, "<ButtonRelease-1>",
+                               lambda e, u=url: self._link_release(u))
+                    t.tag_bind(lt, "<Enter>",
+                               lambda e: t.config(cursor="hand2"))
+                    t.tag_bind(lt, "<Leave>",
+                               lambda e: t.config(cursor="arrow"))
+                t.insert("end", "\n", ttag)
         t.config(state="disabled")
         t.see("1.0" if upside else "end")
 
