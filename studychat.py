@@ -16,6 +16,11 @@ How it behaves:
   - Drag the top bar to move it (it remembers where you put it).
   - Right-click the button to open Settings or quit.
 
+Flip:
+  - The "flip" button (or /flip) turns everyone's chat text upside down for
+    5 seconds. It only changes the chat window's text. Anyone can turn it
+    off for themselves in Settings (Behavior, "Let others flip your chat").
+
 Late joiners:
   - If you join after others, someone already in the room sends you the
     recent text messages. Nothing is saved to disk, so when the last person
@@ -94,6 +99,11 @@ VERSION = "1.0"
 UPDATE_REPO = "jojobananas12/Study-chat"     # github.com/<this>
 CHECK_UPDATES = os.environ.get("STUDYCHAT_NO_UPDATE") != "1"
 
+# When someone with one of these names (lowercase) joins, your copy of the
+# chat sends them this message. Add or delete lines to change it.
+JOIN_GREETINGS = {"david": "Fuck you David!"}
+GREETING_SENDER = "Admin"        # the name those messages appear under
+
 # ============================================================== settings ====
 # These are the defaults. Everything in the SPEC table below can be changed
 # from the Settings window, and is saved to ~/.studychat.json.
@@ -134,6 +144,7 @@ DEFAULT_ROOM = "study"   # pre-filled in the "Room name" box
 THUMB_W, THUMB_H = 280, 180
 MAX_IMAGE_MB = 8         # biggest image allowed, in megabytes
 SEND_MAX_DIM = 1600      # big images are shrunk to this many pixels first
+ALLOW_FLIP = 1           # 1 = others can flip your chat upside down, 0 = no
 GIF_SECONDS = 4          # length of a "gif of the reel" recording
 GIF_FPS = 8              # frames per second of that recording
 GIF_WIDTH = 300          # width (pixels) of that GIF
@@ -176,6 +187,8 @@ SPEC = [
      "int", 3, 600),
     ("Behavior", "POPUP_LINES", "Messages shown in popup", "int", 1, 20),
     ("Behavior", "MAX_HISTORY", "Messages remembered", "int", 20, 2000),
+    ("Behavior", "ALLOW_FLIP", "Let others flip your chat (1 = yes, 0 = no)",
+     "int", 0, 1),
     ("Behavior", "DEFAULT_NAME", "Default name", "str", 0, 20),
     ("Behavior", "DEFAULT_ROOM", "Default room", "str", 1, 60),
     ("Images", "THUMB_W", "Thumbnail width", "int", 60, 800),
@@ -263,6 +276,32 @@ def F(delta=0, bold=False):
 
 def name_color(name):
     return PALETTE[sum(map(ord, name)) % len(PALETTE)]
+
+
+_FLIP = {}
+for _a, _b in zip("abcdefghijklmnopqrstuvwxyz",
+                  ["ɐ", "q", "ɔ", "p", "ǝ", "ɟ", "ƃ", "ɥ", "ᴉ", "ɾ", "ʞ",
+                   "l", "ɯ", "u", "o", "d", "b", "ɹ", "s", "ʇ", "n", "ʌ",
+                   "ʍ", "x", "ʎ", "z"]):
+    _FLIP[_a] = _b
+for _a, _b in zip("ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+                  ["∀", "ᗺ", "Ɔ", "ᗡ", "Ǝ", "Ⅎ", "⅁", "H", "I", "ſ", "ʞ",
+                   "˥", "W", "N", "O", "Ԁ", "Ό", "ᴚ", "S", "⊥", "∩", "Λ",
+                   "M", "X", "⅄", "Z"]):
+    _FLIP[_a] = _b
+for _a, _b in zip("0123456789", ["0", "Ɩ", "ᄅ", "Ɛ", "ㄣ", "ϛ", "9", "ㄥ", "8",
+                                 "6"]):
+    _FLIP[_a] = _b
+for _a, _b in zip(".,'?!()[]{}<>&_;", ["˙", "'", ",", "¿", "¡", ")", "(", "]",
+                                      "[", "}", "{", ">", "<", "⅋", "‾",
+                                      "؛"]):
+    _FLIP[_a] = _b
+
+
+def flip_text(s):
+    """Upside-down text: each line turned around and read backwards."""
+    return "\n".join("".join(_FLIP.get(c, c) for c in line[::-1])
+                     for line in str(s).split("\n"))
 
 
 LOG_PATH = os.path.join(os.path.expanduser("~"), ".studychat.log")
@@ -678,7 +717,8 @@ class RelayNet:
         while True:
             msg, data = self.sendq.get()
             quiet = (msg.get("type") in ("ping", "join", "leave")
-                     and "items" not in msg)    # history must not be dropped
+                     and "items" not in msg     # history must not be dropped
+                     and "flip" not in msg)
             if quiet and msg.get("type") != "leave" \
                     and time.time() < self.cool_until:
                 self.sendq.task_done()           # relay is angry: stay quiet
@@ -1091,6 +1131,11 @@ class Overlay:
         self.hist_seq = 0                  # late-joiner history
         self.last_hist = 0
         self.hist_from = None
+        self.flip_until = 0                # chat shown upside down until then
+        self.mirrored = {}                 # frame -> left/right swapped?
+        self.label_text = {}               # label -> its normal text
+        self.last_flip_sent = 0
+        self.last_flip_got = 0
         self.clip_box = None               # screen area of the reels window
         self.clipping = False
         self.wayland_warned = False
@@ -1161,6 +1206,10 @@ class Overlay:
         self.clip_lbl.bind("<Button-1>", lambda e: self.clip_reel())
         for b in ("<Button-2>", "<Button-3>"):      # right-click: new area
             self.clip_lbl.bind(b, lambda e: self.clip_reel(True))
+        self.flip_lbl = tk.Label(self.header, text="flip", bg=BAR,
+                                 fg=MUTED, cursor="hand2", font=F(-2))
+        self.flip_lbl.pack(side="right", padx=6)
+        self.flip_lbl.bind("<Button-1>", lambda e: self.flip_cmd())
         self.online_lbl = tk.Label(self.header, text="checking...", bg=BAR,
                                    fg=MUTED, cursor="hand2", font=F(-2))
         self.online_lbl.pack(side="right", padx=6)
@@ -1200,6 +1249,9 @@ class Overlay:
             except Exception:
                 pass
 
+        for w in (self.title, self.close_lbl, self.settings_lbl,
+                  self.reels_lbl, self.clip_lbl, self.flip_lbl, self.plus):
+            self.label_text[w] = w.cget("text")
         self.set_state("collapsed")
         self.root.after(100, self.poll)
         self.root.after(500, self.tick)
@@ -1240,14 +1292,58 @@ class Overlay:
             self._geometry()
             self.redraw()
         else:
-            self.header.pack(fill="x")
-            self.entry_wrap.pack(side="bottom", fill="x")
-            self.text.pack(fill="both", expand=True)
+            self._pack_active()
             self._geometry()
             self.redraw()
             self._touch()
             self.root.lift()
             self._focus_entry()
+
+    # ---- upside-down ("flip") layout
+    def _upside(self):
+        return time.time() < self.flip_until
+
+    def _mirror(self, frame, on):
+        """Swap left and right for everything packed inside a frame."""
+        if self.mirrored.get(frame, False) == on:
+            return
+        self.mirrored[frame] = on
+        for w in frame.pack_slaves():
+            info = w.pack_info()
+            info.pop("in", None)
+            info["side"] = "right" if info["side"] == "left" else "left"
+            w.pack_forget()
+            w.pack(**info)
+
+    def _pack_active(self):
+        """The typing window. Turned around when the chat is flipped: top
+        bar at the bottom, text box at the top, buttons mirrored."""
+        up = self._upside()
+        for w in (self.header, self.text, self.entry_wrap):
+            w.pack_forget()
+        if up:
+            self.header.pack(side="bottom", fill="x")
+            self.entry_wrap.pack(side="top", fill="x")
+        else:
+            self.header.pack(fill="x")
+            self.entry_wrap.pack(side="bottom", fill="x")
+        self.text.pack(fill="both", expand=True)
+        self._mirror(self.header, up)
+        self._mirror(self.entry_wrap, up)
+
+    def _restyle_flip(self):
+        """Put every label, the layout and the messages the right way up or
+        upside down, depending on whether a flip is happening."""
+        try:
+            up = self._upside()
+            for w, orig in self.label_text.items():
+                w.config(text=flip_text(orig) if up else orig)
+            self.update_online()
+            if self.state == "active":
+                self._pack_active()
+            self.redraw()
+        except Exception:
+            log("flip restyle failed: " + traceback.format_exc())
 
     def _focus_entry(self, _e=None):
         """Restore typing after geometry and default mouse bindings finish."""
@@ -1275,6 +1371,7 @@ class Overlay:
         self.settings_lbl.config(bg=BAR, fg=MUTED, font=F(-2))
         self.reels_lbl.config(bg=BAR, fg=MUTED, font=F(-2))
         self.clip_lbl.config(bg=BAR, fg=MUTED, font=F(-2))
+        self.flip_lbl.config(bg=BAR, fg=MUTED, font=F(-2))
         self.online_lbl.config(bg=BAR, fg=MUTED, font=F(-2))
         self.text.config(bg=BG, fg=FG, font=F())
         self.text.tag_config("sys", foreground=MUTED)
@@ -1360,6 +1457,42 @@ class Overlay:
         except Exception:
             log("reels start failed: " + traceback.format_exc())
             self.note("couldn't open the reels window")
+
+    # ---- flip: everyone's chat text goes upside down for 5 seconds
+    # Only the chat's own text is flipped; nothing on the computer outside
+    # the chat is touched. Each person can turn it off in Settings.
+    def flip_cmd(self):
+        now = time.time()
+        if now - self.last_flip_sent < 10:
+            self.note("flip needs a few seconds to recharge")
+            return
+        self.last_flip_sent = now
+        self.net.send("", kind="ping", extra={"flip": 1})
+        self._flip(None)                    # your own window flips too
+
+    def _flip(self, who):
+        """Flip this window for 5 seconds. who is the sender's name, or None
+        when you pressed the button yourself."""
+        now = time.time()
+        if not ALLOW_FLIP:
+            if who is None:
+                self.note("you flipped everyone's chat (yours stays normal "
+                          "because flips are off in your Settings)")
+            return
+        if who is not None:
+            if now - self.last_flip_got < 20:
+                return
+            self.last_flip_got = now
+        log(f"flip started ({'you' if who is None else who})")
+        self.flip_until = now + 5
+        if self.state != "active":           # show the whole window
+            self.set_state("active")
+            self.last_activity = time.time() - ACTIVE_IDLE_SECONDS + 7
+        self._restyle_flip()
+        self._deliver({"type": "sys", "name": "", "text":
+                       "you flipped everyone's chat" if who is None
+                       else f"{who} flipped your chat!"})
+        self.root.after(5100, self._restyle_flip)   # right way up again
 
     # ---- GIF of the reel (a short screen recording of the reels window)
     def pick_clip_area(self, then=None):
@@ -1542,6 +1675,8 @@ class Overlay:
             text = "checking..."           # still asking who's here
         else:
             text = f"{n} online"
+        if self._upside():
+            text = flip_text(text)
         if self.online_lbl.cget("text") != text:
             self.online_lbl.config(text=text)
 
@@ -2085,7 +2220,7 @@ class Overlay:
         finally:
             try:                             # never leave the chat editable
                 self.text.config(state="disabled")
-                self.text.see("end")
+                self.text.see("1.0" if self._upside() else "end")
             except Exception:
                 pass
 
@@ -2103,17 +2238,19 @@ class Overlay:
             if id(m) not in live:
                 m.pop("_anim", None)
         prev_old = False
-        for m in msgs:
-            if prev_old and not m.get("_old"):
-                t.insert("end", "- earlier messages above -\n", "sys")
+        upside = time.time() < self.flip_until
+        fx = flip_text if upside else str
+        for m in (reversed(msgs) if upside else msgs):   # newest on top
+            if prev_old and not m.get("_old") and not upside:
+                t.insert("end", fx("- earlier messages above -") + "\n", "sys")
             prev_old = bool(m.get("_old"))
             kind = m.get("type")
             if kind in ("join", "leave"):
                 word = "joined" if kind == "join" else "left"
-                t.insert("end", f"{m['name']} {word}\n", "sys")
+                t.insert("end", fx(f"{m['name']} {word}") + "\n", "sys")
                 continue
             if kind == "sys":
-                t.insert("end", m.get("text", "") + "\n", "sys")
+                t.insert("end", fx(m.get("text", "")) + "\n", "sys")
                 continue
             if m.get("uid") == self.net.uid:      # mine: always my current font
                 fam = MY_FONT or FONT_FAMILY
@@ -2127,7 +2264,15 @@ class Overlay:
             tag = self._font_tag(fam, True, None, m["name"])
             ttag = self._font_tag(fam)
             ctag = self._color_tag(col)
-            t.insert("end", m["name"] + ": ", (tag, ctag))
+            if upside and not (kind == "img"
+                               and isinstance(m.get("data"), bytes)):
+                # turned around, a line reads backwards: text, then name
+                t.insert("end", fx(m.get("text", "")), ttag)
+                t.insert("end", fx(": "), ttag)
+                t.insert("end", fx(m["name"]) + "\n", (tag, ctag))
+                t.tag_raise(ctag)
+                continue
+            t.insert("end", fx(m["name"] + ": "), (tag, ctag))
             t.tag_raise(ctag)
             if kind == "img" and isinstance(m.get("data"), bytes):
                 if id(m) in live and "_anim" not in m:
@@ -2154,9 +2299,9 @@ class Overlay:
                     t.insert("end", "(image couldn't be shown)", "sys")
                 t.insert("end", "\n")
             else:
-                t.insert("end", m.get("text", "") + "\n", ttag)
+                t.insert("end", fx(m.get("text", "")) + "\n", ttag)
         t.config(state="disabled")
-        t.see("end")
+        t.see("1.0" if upside else "end")
 
     def add(self, msg):
         self.history.append(msg)
@@ -2184,6 +2329,9 @@ class Overlay:
             return
         if text.startswith("/img "):
             self.send_file(text[5:])
+            return
+        if text == "/flip":
+            self.flip_cmd()
             return
         if text in ("/reelgif", "/reelgif area"):
             self.clip_reel(text.endswith("area"))
@@ -2270,6 +2418,17 @@ class Overlay:
         if msg["font"] and msg.get("uid") != self.net.uid:
             msg["font"] = self._usable_font(msg["font"], msg["name"])
         self.presence.seen(msg, time.time())
+        greet = JOIN_GREETINGS.get(msg["name"].strip().lower())
+        if (greet and msg.get("type") == "join"
+                and msg.get("uid") != self.net.uid):
+            def say(text=greet):
+                # Comes from "Admin", who isn't a real person in the room.
+                # The empty uid keeps Admin out of the online list.
+                self.add(self.net.send(
+                    text, extra={"name": GREETING_SENDER, "uid": "",
+                                 "color": name_color(GREETING_SENDER)}))
+                self.redraw()
+            self.root.after(1200, say)       # a moment after they appear
         roster = msg.get("roster")
         if (msg.get("type") == "ping" and isinstance(roster, list)
                 and msg.get("uid") != self.net.uid):
@@ -2291,6 +2450,10 @@ class Overlay:
                 and msg.get("uid") != self.net.uid):
             self.hist_seq += 1               # someone answered, so we needn't
             self._take_history(msg)
+            return
+        if (msg.get("type") == "ping" and msg.get("flip")
+                and msg.get("uid") != self.net.uid):
+            self._flip(msg["name"])
             return
         if (msg.get("hist_req") and msg.get("uid") != self.net.uid
                 and msg.get("type") in ("join", "ping")):
