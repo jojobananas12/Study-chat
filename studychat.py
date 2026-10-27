@@ -41,7 +41,9 @@ School wifi:
 Links in messages are clickable (Instagram links open the small reels
   window). Select chat text with the mouse and press Ctrl+C (Cmd+C on a
   Mac) to copy it, or right-click a line or link for a copy menu.
-Commands: /getfonts (install the free fonts your friends use),
+Top bar: the "menu" dropdown holds flip, GIF, reels, settings, updates and
+  Disconnect (leaves the room and closes the program).
+Commands: /disconnect (or /quit), /getfonts (install the free fonts your friends use),
   /reels [link] (small Instagram window; needs Chrome, Chromium,
   Edge or Brave, or pywebview), /reelgif (send a GIF of the reel; same as
   the "gif" button, "/reelgif area" picks the screen area again),
@@ -99,7 +101,7 @@ except Exception:
 # ------------------------------------------------------------------ version
 # Bump VERSION whenever you publish a new studychat.py to GitHub. Everyone
 # running an older version is told, and can update with one click.
-VERSION = "1.4"
+VERSION = "1.5"
 UPDATE_REPO = "jojobananas12/Study-chat"     # github.com/<this>
 CHECK_UPDATES = os.environ.get("STUDYCHAT_NO_UPDATE") != "1"
 
@@ -1354,20 +1356,8 @@ class Overlay:
         self.pill = tk.Label(root, text=PILL_LABEL, bg=PILL_BG, fg=PILL_FG,
                              font=F(3, True), cursor="hand2")
         self.pill.bind("<Button-1>", lambda e: self.set_state("active"))
-        self.menu = tk.Menu(root, tearoff=0)
-        self.menu.add_command(label="Settings...",
-                              command=self.open_settings)
-        self.menu.add_command(label="Instagram reels window",
-                              command=self.open_reels)
-        self.menu.add_command(label="Send GIF of the reel",
-                              command=self.clip_reel)
-        self.menu.add_command(label="Pick the reel area again",
-                              command=lambda: self.clip_reel(True))
-        self.menu.add_command(label="Check for updates",
-                              command=self.update_cmd)
-        self.menu.add_command(label="Quit", command=root.destroy)
         for b in ("<Button-2>", "<Button-3>"):
-            self.pill.bind(b, lambda e: self.menu.tk_popup(e.x_root, e.y_root))
+            self.pill.bind(b, lambda e: self._pop_menu(e.x_root, e.y_root))
 
         self.header = tk.Frame(root, bg=BAR)
         self.title = tk.Label(self.header, bg=BAR, fg=MUTED,
@@ -1380,24 +1370,10 @@ class Overlay:
         self.close_lbl.pack(side="right", padx=6)
         self.close_lbl.bind("<Button-1>",
                             lambda e: self.set_state("collapsed"))
-        self.settings_lbl = tk.Label(self.header, text="settings", bg=BAR,
-                                     fg=MUTED, cursor="hand2", font=F(-2))
-        self.settings_lbl.pack(side="right", padx=6)
-        self.settings_lbl.bind("<Button-1>", lambda e: self.open_settings())
-        self.reels_lbl = tk.Label(self.header, text="reels", bg=BAR,
-                                  fg=MUTED, cursor="hand2", font=F(-2))
-        self.reels_lbl.pack(side="right", padx=6)
-        self.reels_lbl.bind("<Button-1>", lambda e: self.open_reels())
-        self.clip_lbl = tk.Label(self.header, text="gif", bg=BAR,
+        self.menu_lbl = tk.Label(self.header, text="menu \u25be", bg=BAR,
                                  fg=MUTED, cursor="hand2", font=F(-2))
-        self.clip_lbl.pack(side="right", padx=6)
-        self.clip_lbl.bind("<Button-1>", lambda e: self.clip_reel())
-        for b in ("<Button-2>", "<Button-3>"):      # right-click: new area
-            self.clip_lbl.bind(b, lambda e: self.clip_reel(True))
-        self.flip_lbl = tk.Label(self.header, text="flip", bg=BAR,
-                                 fg=MUTED, cursor="hand2", font=F(-2))
-        self.flip_lbl.pack(side="right", padx=6)
-        self.flip_lbl.bind("<Button-1>", lambda e: self.flip_cmd())
+        self.menu_lbl.pack(side="right", padx=6)
+        self.menu_lbl.bind("<Button-1>", self._header_menu)
         self.online_lbl = tk.Label(self.header, text="checking...", bg=BAR,
                                    fg=MUTED, cursor="hand2", font=F(-2))
         self.online_lbl.pack(side="right", padx=6)
@@ -1446,8 +1422,7 @@ class Overlay:
             except Exception:
                 pass
 
-        for w in (self.title, self.close_lbl, self.settings_lbl,
-                  self.reels_lbl, self.clip_lbl, self.flip_lbl, self.plus):
+        for w in (self.title, self.close_lbl, self.menu_lbl, self.plus):
             self.label_text[w] = w.cget("text")
         self.set_state("collapsed")
         self.root.after(100, self.poll)
@@ -1573,11 +1548,8 @@ class Overlay:
         self.header.config(bg=BAR)
         self.title.config(bg=BAR, fg=MUTED, font=F(-2))
         self.close_lbl.config(bg=BAR, fg=MUTED, font=F(-1))
-        self.settings_lbl.config(bg=BAR, fg=MUTED, font=F(-2))
-        self.reels_lbl.config(bg=BAR, fg=MUTED, font=F(-2))
+        self.menu_lbl.config(bg=BAR, fg=MUTED, font=F(-2))
         self.fonts_lbl.config(bg=BAR, font=F(-2))
-        self.clip_lbl.config(bg=BAR, fg=MUTED, font=F(-2))
-        self.flip_lbl.config(bg=BAR, fg=MUTED, font=F(-2))
         self.online_lbl.config(bg=BAR, fg=MUTED, font=F(-2))
         self.text.config(bg=BG, fg=FG, font=F())
         self.text.tag_config("sys", foreground=MUTED)
@@ -2120,6 +2092,53 @@ class Overlay:
             # Restore it afterwards, retaining normal history selection.
             self._focus_entry()
 
+    def _fill_menu(self, m):
+        m.add_command(label="Who's online", command=self.show_who)
+        m.add_separator()
+        m.add_command(label="Flip everyone's chat", command=self.flip_cmd)
+        m.add_command(label="Send GIF of the reel", command=self.clip_reel)
+        m.add_command(label="Pick the reel area again",
+                      command=lambda: self.clip_reel(True))
+        m.add_command(label="Instagram reels window",
+                      command=self.open_reels)
+        m.add_separator()
+        if self.font_offers:
+            m.add_command(label=f"Get fonts ({len(self.font_offers)})",
+                          command=self.fonts_cmd)
+        if self.update_info:
+            m.add_command(label=f"Update to v{self.update_info['version']}",
+                          command=self.update_cmd)
+        else:
+            m.add_command(label="Check for updates", command=self.update_cmd)
+        m.add_command(label="Settings...", command=self.open_settings)
+        m.add_separator()
+        m.add_command(label="Disconnect and quit", command=self.disconnect)
+
+    def _pop_menu(self, x, y):
+        menu = self.tk.Menu(self.root, tearoff=0)
+        self._fill_menu(menu)
+        self.busy = True                     # keep the chat open meanwhile
+        try:
+            menu.tk_popup(x, y)
+        finally:
+            menu.grab_release()
+            self.busy = self.settings_win is not None
+            self._touch()
+
+    def _header_menu(self, _e=None):
+        """The "menu" dropdown in the top bar."""
+        w = self.menu_lbl
+        self._pop_menu(w.winfo_rootx(), w.winfo_rooty() + w.winfo_height())
+        return "break"
+
+    def disconnect(self):
+        """Leave the room (everyone sees you leave) and close the program."""
+        log("disconnect chosen")
+        try:
+            self.root.destroy()              # main() then says goodbye
+        except Exception:
+            pass
+
     def _link_at(self, index):
         for tag in self.text.tag_names(index):
             if tag in self.link_urls:
@@ -2622,7 +2641,7 @@ class Overlay:
         self._touch()
         if not text:
             return
-        if text == "/quit":
+        if text in ("/quit", "/disconnect"):
             self.root.destroy()
             return
         if text == "/settings":
