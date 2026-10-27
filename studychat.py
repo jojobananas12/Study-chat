@@ -16,6 +16,11 @@ How it behaves:
   - Drag the top bar to move it (it remembers where you put it).
   - Right-click the button to open Settings or quit.
 
+Late joiners:
+  - If you join after others, someone already in the room sends you the
+    recent text messages. Nothing is saved to disk, so when the last person
+    leaves, the chat is gone. (Images from before you joined don't come.)
+
 Settings:
   - Click "settings" in the top bar (or type /settings). Colors, opacity,
     sizes, timings and more. Changes preview live; click Save to keep them.
@@ -665,7 +670,8 @@ class RelayNet:
         url = f"{self.base}/{self.topic}"
         while True:
             msg, data = self.sendq.get()
-            quiet = msg.get("type") in ("ping", "join", "leave")
+            quiet = (msg.get("type") in ("ping", "join", "leave")
+                     and "items" not in msg)    # history must not be dropped
             if quiet and msg.get("type") != "leave" \
                     and time.time() < self.cool_until:
                 self.sendq.task_done()           # relay is angry: stay quiet
@@ -1074,6 +1080,9 @@ class Overlay:
         self.last_reply = 0
         self.reply_seq = 0
         self.update_info = None            # newer version found on GitHub
+        self.hist_seq = 0                  # late-joiner history
+        self.last_hist = 0
+        self.hist_from = None
 
         if root.tk.call("tk", "windowingsystem") == "aqua":
             # Aqua treats overrideredirect windows as non-activating and
@@ -1364,6 +1373,110 @@ class Overlay:
                       in list(self.presence.peers.items())[:40]]
             self.net.send("", kind="ping", extra={"roster": roster})
         self.root.after(random.randint(0, top), go)
+
+    # ---- history for people who join late
+    # Nothing is saved to disk. Everyone in the room keeps the chat in
+    # memory, and when someone joins, one person who is already here hands
+    # them the recent text messages. When the last person leaves, the chat
+    # is gone. (Sent as quiet "ping" messages, so older versions of the
+    # app just ignore them.)
+    def _schedule_history(self):
+        now = time.time()
+        if now - self.last_hist < 3:
+            return
+        self.last_hist = now
+        self.hist_seq += 1
+        seq = self.hist_seq
+        top = 2500 if self.net.mode == "online" else 600
+
+        def go():
+            if seq != self.hist_seq:         # someone else already answered
+                return
+            try:
+                self._send_history()
+            except Exception:
+                log("history send failed: " + traceback.format_exc())
+        self.root.after(random.randint(200, top), go)
+
+    def _send_history(self):
+        online = self.net.mode == "online"
+        chunk_cap = 3000 if online else 1000       # bytes per message
+        total_cap = 7000 if online else 12000      # bytes in all
+        picked, used = [], 0
+        for m in reversed(self.history):
+            if (m.get("type") != "msg" or not m.get("text")
+                    or not isinstance(m.get("id"), str)):
+                continue
+            it = {"id": m["id"], "name": m.get("name", "?"),
+                  "text": m["text"][:400], "uid": m.get("uid") or "",
+                  "font": m.get("font") or ""}
+            size = len(json.dumps(it)) + 2
+            if size > chunk_cap:
+                continue
+            if used + size > total_cap:
+                break
+            picked.append(it)
+            used += size
+        picked.reverse()
+        if not picked:
+            return
+        for k, it in enumerate(picked):
+            it["k"] = k
+        chunks, cur, cur_size = [], [], 0
+        for it in picked:
+            size = len(json.dumps(it)) + 2
+            if cur and cur_size + size > chunk_cap:
+                chunks.append(cur)
+                cur, cur_size = [], 0
+            cur.append(it)
+            cur_size += size
+        if cur:
+            chunks.append(cur)
+        for i, chunk in enumerate(chunks):
+            self.root.after(i * 150, lambda c=chunk: self.net.send(
+                "", kind="ping", extra={"items": c}))
+
+    def _take_history(self, msg):
+        """Add earlier messages sent by someone already in the room."""
+        items, who = msg.get("items"), msg.get("uid")
+        if not isinstance(items, list) or not isinstance(who, str):
+            return
+        if self.hist_from is None:
+            self.hist_from = who             # keep to one sender's list
+        elif self.hist_from != who:
+            return
+        have = {m.get("id") for m in self.history}
+        lead = 0                             # earlier ones sit at the front
+        while lead < len(self.history) and self.history[lead].get("_old"):
+            lead += 1
+        added = False
+        for it in items[:60]:
+            if not isinstance(it, dict):
+                continue
+            mid, k = it.get("id"), it.get("k")
+            if (not isinstance(mid, str) or not mid or mid in have
+                    or not isinstance(k, int)):
+                continue
+            name = str(it.get("name", "?"))[:20]
+            font = "".join(c for c in str(it.get("font", ""))
+                           if c.isprintable())[:60].strip()
+            if font:
+                font = self._usable_font(font, name)
+            m = {"type": "msg", "id": mid, "name": name,
+                 "text": str(it.get("text", ""))[:2000], "font": font,
+                 "uid": it.get("uid") if isinstance(it.get("uid"), str)
+                 else "", "_old": True, "_hk": k}
+            pos = 0
+            while pos < lead and self.history[pos]["_hk"] <= k:
+                pos += 1
+            self.history.insert(pos, m)
+            lead += 1
+            have.add(mid)
+            self.net.seen.add(mid)
+            added = True
+        del self.history[:-MAX_HISTORY]
+        if added and self.state != "collapsed":
+            self.redraw()
 
     # ---- updates
     def start_update_check(self):
@@ -1794,7 +1907,11 @@ class Overlay:
         for m in gifs:
             if id(m) not in live:
                 m.pop("_anim", None)
+        prev_old = False
         for m in msgs:
+            if prev_old and not m.get("_old"):
+                t.insert("end", "- earlier messages above -\n", "sys")
+            prev_old = bool(m.get("_old"))
             kind = m.get("type")
             if kind in ("join", "leave"):
                 word = "joined" if kind == "join" else "left"
@@ -1961,6 +2078,14 @@ class Overlay:
                 or (msg.get("type") == "ping" and msg.get("text") == "who")):
             # say hi back so the newcomer sees who's here
             self._reply_roll()
+        if (msg.get("type") == "ping" and isinstance(msg.get("items"), list)
+                and msg.get("uid") != self.net.uid):
+            self.hist_seq += 1               # someone answered, so we needn't
+            self._take_history(msg)
+            return
+        if (msg.get("hist_req") and msg.get("uid") != self.net.uid
+                and msg.get("type") in ("join", "ping")):
+            self._schedule_history()         # newcomer wants earlier messages
         if msg.get("type") == "ping":          # quiet "still here" signal
             return
         self._deliver(msg)
@@ -1994,7 +2119,8 @@ class Overlay:
                 if (alone and self.roll_sent < (2 if self.net.mode == "online" else 3)
                         and waited >= (0.3, 3.0, 8.0)[self.roll_sent]):
                     self.roll_sent += 1
-                    self.net.send("who", kind="ping")
+                    self.net.send("who", kind="ping",
+                                  extra={"hist_req": 1})
                 if waited > 3.5:
                     self.roll_done = True
                     self.update_online()
@@ -2236,7 +2362,7 @@ def main():
                          "that can freeze. Install Python from python.org.")
     except Exception:
         pass
-    net.send("joined", kind="join")
+    net.send("joined", kind="join", extra={"hist_req": 1})
     overlay.add({"type": "join", "name": "You", "text": ""})
     overlay.start_update_check()
     try:
