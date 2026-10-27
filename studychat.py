@@ -28,10 +28,17 @@ School wifi:
     must pick the same mode. Online mode is NOT private, so use a long,
     hard-to-guess room name.
 
+Commands: /who (who's online), /update (check for a new version),
+  /version, /settings, /img, /quit. The chat checks GitHub for a newer
+  version when it starts; set STUDYCHAT_NO_UPDATE=1 to turn that off.
+
 Images:
   - Press Ctrl+V in the text box to send an image from your clipboard
     (screenshots work great), or click "+" to pick an image file,
     or type  /img path/to/file.png
+  - GIFs keep moving: send one with "+" or  /img path/to/file.gif , or with
+    a direct link:  /gif https://example.com/funny.gif  (right-click a GIF
+    and "copy image address"). Only the newest few GIFs animate.
   - Click an image in the chat to see it full size (click it again to close).
   - Install Pillow for best results:  pip install pillow
     (without it, only PNG and GIF files can be sent, and no clipboard paste)
@@ -39,14 +46,17 @@ Images:
 
 import argparse
 import base64
+import email.utils
 import hashlib
 import io
 import json
 import os
 import queue
+import random
 import re
 import socket
 import ssl
+import subprocess
 import sys
 import threading
 import time
@@ -65,6 +75,13 @@ try:
 except Exception:
     ImageTk = None
 
+# ------------------------------------------------------------------ version
+# Bump VERSION whenever you publish a new studychat.py to GitHub. Everyone
+# running an older version is told, and can update with one click.
+VERSION = "1.0"
+UPDATE_REPO = "jojobananas12/Study-chat"     # github.com/<this>
+CHECK_UPDATES = os.environ.get("STUDYCHAT_NO_UPDATE") != "1"
+
 # ============================================================== settings ====
 # These are the defaults. Everything in the SPEC table below can be changed
 # from the Settings window, and is saved to ~/.studychat.json.
@@ -81,7 +98,8 @@ BG = "#14161c"           # chat background
 BAR = "#1d2029"          # top bar and text box color
 FG = "#e8e8e8"           # message text color
 MUTED = "#8a90a0"        # faded text color
-FONT_FAMILY = "Segoe UI"
+FONT_FAMILY = "Papyrus"
+MY_FONT = ""             # font for YOUR messages (blank = use the one above)
 FONT_SIZE = 10
 
 # --- Window
@@ -109,7 +127,7 @@ SEND_MAX_DIM = 1600      # big images are shrunk to this many pixels first
 PORT = 50555             # same-wifi mode (everyone must match)
 RELAY_URL = "https://ntfy.sh"   # online mode
 WIFI_PING_EVERY = 20     # seconds between "I'm still here" signals
-ONLINE_PING_EVERY = 45
+ONLINE_PING_EVERY = 240
 
 PALETTE = ["#5aa9ff", "#ff7a7a", "#7be08a", "#ffd166", "#c792ea",
            "#4dd0e1", "#ffab70", "#f48fb1"]
@@ -129,6 +147,8 @@ SPEC = [
     ("Look", "FG", "Message text color", "color", 0, 0),
     ("Look", "MUTED", "Faded text color", "color", 0, 0),
     ("Look", "FONT_FAMILY", "Font", "str", 1, 40),
+    ("Look", "MY_FONT", "Font for your messages (everyone sees it)",
+     "font", 0, 40),
     ("Look", "FONT_SIZE", "Text size", "int", 7, 24),
     ("Window", "WIDTH", "Width", "int", 200, 900),
     ("Window", "POPUP_HEIGHT", "Popup height (text)", "int", 60, 600),
@@ -247,6 +267,132 @@ def log(text):
         pass
 
 
+# ------------------------------------------------------------------ updates
+def _ver_tuple(v):
+    nums = re.findall(r"\d+", str(v))
+    return tuple(int(n) for n in nums[:4]) or (0,)
+
+
+def _ssl_ctx():
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        return ssl.create_default_context()
+
+
+def _http_get(url, timeout=12, limit=3_000_000):
+    req = urllib.request.Request(url, headers={"User-Agent": "studychat"})
+    with urllib.request.urlopen(req, timeout=timeout, context=_ssl_ctx()) as r:
+        return r.read(limit + 1)[:limit]
+
+
+def _version_in(text):
+    m = re.search(r'^VERSION\s*=\s*["\']([^"\']+)["\']', text, re.M)
+    return m.group(1) if m else None
+
+
+def check_for_update():
+    """Newest version on GitHub, as {"version", "url"}, or None if you're
+    already up to date. Looks at the latest release and at the main branch,
+    and takes whichever is newest. Raises if GitHub can't be reached."""
+    found, reached = [], False
+    try:
+        data = json.loads(_http_get(
+            f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest",
+            timeout=10).decode("utf-8"))
+        tag = str(data.get("tag_name", "")).strip()
+        if tag:
+            found.append({"version": tag.lstrip("vV"), "url":
+                          f"https://raw.githubusercontent.com/"
+                          f"{UPDATE_REPO}/{tag}/studychat.py"})
+        reached = True
+    except urllib.error.HTTPError as ex:
+        reached = reached or ex.code == 404     # no releases yet is fine
+    except Exception:
+        pass
+    for branch in ("main", "master"):
+        url = (f"https://raw.githubusercontent.com/"
+               f"{UPDATE_REPO}/{branch}/studychat.py")
+        try:
+            ver = _version_in(_http_get(url).decode("utf-8", "replace"))
+            reached = True
+            if ver:
+                found.append({"version": ver, "url": url})
+            break
+        except urllib.error.HTTPError:
+            reached = True
+        except Exception:
+            pass
+    if not reached:
+        raise OSError("can't reach GitHub")
+    found = [f for f in found if _ver_tuple(f["version"]) > _ver_tuple(VERSION)]
+    return max(found, key=lambda f: _ver_tuple(f["version"])) if found else None
+
+
+def install_update(info):
+    """Download the new studychat.py, check it, keep a backup of this one,
+    and swap it in. Returns the new version. Raises if anything is off."""
+    raw = _http_get(info["url"])
+    text = raw.decode("utf-8")
+    if "def main" not in text or "class Overlay" not in text:
+        raise ValueError("downloaded file doesn't look like studychat")
+    compile(text, "studychat.py", "exec")           # must be valid Python
+    ver = _version_in(text)
+    if not ver or _ver_tuple(ver) <= _ver_tuple(VERSION):
+        raise ValueError("downloaded file isn't newer")
+    path = os.path.abspath(__file__)
+    with open(path, "rb") as f:
+        old = f.read()
+    with open(path + ".bak", "wb") as f:            # easy to undo
+        f.write(old)
+    tmp = path + ".new"
+    with open(tmp, "wb") as f:
+        f.write(raw)
+    os.replace(tmp, path)
+    return ver
+
+
+# ---------------------------------------------------------------------- gifs
+MAX_GIF_FRAMES = 100       # more frames than this are skipped to save memory
+LIVE_GIFS = 5              # only the newest few GIFs in the chat animate
+
+
+def gif_delays(data):
+    """Per-frame delays (ms) read straight from a GIF file."""
+    out = [max(20, (b[0] | (b[1] << 8)) * 10) for b in
+           re.findall(rb"\x21\xf9\x04.(..)", data, re.S)]
+    return [d if d > 20 else 100 for d in out]
+
+
+def shrink_gif(data, limit):
+    """Make an animated GIF smaller (fewer pixels, then fewer frames) until it
+    fits under `limit` bytes. Needs Pillow. Returns bytes, or None."""
+    if not PIL_OK:
+        return None
+    try:
+        im = Image.open(io.BytesIO(data))
+        n = getattr(im, "n_frames", 1)
+        frames, durs = [], []
+        step = 1 if n <= 150 else 2
+        for k in range(0, n, step):
+            im.seek(k)
+            frames.append(im.convert("RGBA"))
+            durs.append(max(20, int(im.info.get("duration", 100))) * step)
+        for scale in (0.8, 0.6, 0.45, 0.3):
+            w, h = frames[0].size
+            size = (max(16, int(w * scale)), max(16, int(h * scale)))
+            small = [f.resize(size) for f in frames]
+            buf = io.BytesIO()
+            small[0].save(buf, "GIF", save_all=True, append_images=small[1:],
+                          duration=durs, loop=0, optimize=True, disposal=2)
+            if buf.tell() <= limit:
+                return buf.getvalue()
+    except Exception:
+        log("shrink_gif failed: " + traceback.format_exc())
+    return None
+
+
 # ---------------------------------------------------------------- networking
 class Net:
     """Text goes out by UDP broadcast. Images are announced by broadcast, then
@@ -330,10 +476,12 @@ class Net:
             except OSError:
                 pass
 
-    def send(self, text, kind="msg"):
+    def send(self, text, kind="msg", extra=None):
         msg = {"app": "studychat", "room": self.room, "id": uuid.uuid4().hex,
                "name": self.name, "text": text, "type": kind,
                "uid": self.uid}
+        if extra:
+            msg.update(extra)
         if kind == "ping":
             self._refresh_targets()
         self.seen.add(msg["id"])
@@ -462,7 +610,11 @@ class RelayNet:
         self.connected = False
         self.uid = uuid.uuid4().hex
         self.closed = False
-        self.ping_every = ONLINE_PING_EVERY
+        # The free relay allows only a few posts per minute for everyone on
+        # the same internet address, so keep background chatter rare.
+        self.ping_every = max(ONLINE_PING_EVERY, 180)
+        self.cool_until = 0              # pause quiet signals after a 429
+        self.token = os.environ.get("STUDYCHAT_TOKEN")   # ntfy account
         self.base = RELAY_URL.rstrip("/")
         self.topic = "sc-" + hashlib.sha256(
             ("studychat:" + room).encode("utf-8")).hexdigest()[:32]
@@ -480,13 +632,17 @@ class RelayNet:
 
     def _open(self, req, timeout):
         req.add_header("User-Agent", "studychat")
+        if self.token:
+            req.add_header("Authorization", "Bearer " + self.token)
         return urllib.request.urlopen(req, timeout=timeout, context=self.ctx)
 
     # --- sending (one background thread keeps messages in order)
-    def send(self, text, kind="msg"):
+    def send(self, text, kind="msg", extra=None):
         msg = {"app": "studychat", "room": self.room, "id": uuid.uuid4().hex,
                "name": self.name, "text": text[:1000], "type": kind,
                "uid": self.uid}
+        if extra:
+            msg.update(extra)
         self.seen.add(msg["id"])
         self.sendq.put((msg, None))
         return msg
@@ -503,24 +659,45 @@ class RelayNet:
         url = f"{self.base}/{self.topic}"
         while True:
             msg, data = self.sendq.get()
+            quiet = msg.get("type") in ("ping", "join", "leave")
+            if quiet and msg.get("type") != "leave" \
+                    and time.time() < self.cool_until:
+                self.sendq.task_done()           # relay is angry: stay quiet
+                continue
             try:
                 meta = json.dumps(msg)           # one ASCII line
-                if data is None:
-                    req = urllib.request.Request(
-                        url, data=meta.encode("utf-8"), method="POST")
-                else:
-                    ext = ("png" if data.startswith(b"\x89PNG") else
-                           "gif" if data.startswith(b"GIF8") else "jpg")
-                    req = urllib.request.Request(
-                        url, data=data, method="PUT",
-                        headers={"Filename": f"image.{ext}", "Message": meta})
-                self._open(req, 60).read()
+                for attempt in range(4):
+                    if data is None:
+                        req = urllib.request.Request(
+                            url, data=meta.encode("utf-8"), method="POST")
+                    else:
+                        ext = ("png" if data.startswith(b"\x89PNG") else
+                               "gif" if data.startswith(b"GIF8") else "jpg")
+                        req = urllib.request.Request(
+                            url, data=data, method="PUT",
+                            headers={"Filename": f"image.{ext}",
+                                     "Message": meta})
+                    try:
+                        self._open(req, 60).read()
+                        break
+                    except urllib.error.HTTPError as ex:
+                        if ex.code == 429:
+                            self.cool_until = time.time() + 45
+                        if ex.code != 429 or quiet or attempt == 3:
+                            raise
+                        # the relay says slow down: wait, then try again
+                        if attempt == 0:
+                            self._status("relay is busy, retrying...")
+                        time.sleep(5 * (attempt + 1))
             except urllib.error.HTTPError as ex:
-                self._status("sending too fast, wait a few seconds"
-                             if ex.code == 429
-                             else f"message not sent (error {ex.code})")
+                if not quiet:
+                    self._status("relay is too busy, message not sent; "
+                                 "try again in a minute" if ex.code == 429
+                                 else f"message not sent (error {ex.code})")
             except Exception:
-                self._status("message not sent (is the internet working?)")
+                if not quiet:
+                    self._status("message not sent (is the internet "
+                                 "working?)")
             finally:
                 self.sendq.task_done()
 
@@ -534,10 +711,22 @@ class RelayNet:
         waiter.start()
         waiter.join(4)
 
+    def _server_now(self):
+        try:
+            with self._open(urllib.request.Request(
+                    self.base + "/v1/health"), 8) as r:
+                return email.utils.parsedate_to_datetime(
+                    r.headers.get("Date")).timestamp()
+        except Exception:
+            return time.time()
+
     # --- receiving
     def _subscribe(self):
         backoff = 1
-        start = str(int(time.time()))
+        # Use the relay's clock, not ours: if this laptop's clock is a bit
+        # fast, "since" would be in the future and replies to our join
+        # would be missed (the wrong "online" count on first join).
+        start = str(int(self._server_now() - 3))
         failed = False
         while True:
             try:
@@ -645,6 +834,15 @@ class SettingsWindow:
         self.vars, self.swatches = {}, {}
         self.loading = False
         self.job = None
+        self._picking = False
+        try:
+            from tkinter import font as tkfont
+            self.font_names = sorted({f for f in tkfont.families(ov.root)
+                                      if not f.startswith("@")},
+                                     key=str.lower)
+        except Exception:
+            self.font_names = []
+        self.font_lower = {f.lower(): f for f in self.font_names}
 
         win = self.win = tk.Toplevel(ov.root)
         win.title("Study chat settings")
@@ -715,6 +913,51 @@ class SettingsWindow:
             if kind == "float":
                 opts["format"] = "%.2f"
             ttk.Spinbox(frame, **opts).grid(row=r, column=1, sticky="w")
+        elif kind == "font":
+            # type to search; click a font in the list to choose it
+            cell = ttk.Frame(frame)
+            cell.grid(row=r, column=1, sticky="w")
+            ttk.Entry(cell, textvariable=var, width=34).pack(anchor="w")
+            box = ttk.Frame(cell)
+            box.pack(anchor="w", pady=(3, 0))
+            lb = tk.Listbox(box, height=6, width=36, exportselection=False,
+                            activestyle="none")
+            sb = ttk.Scrollbar(box, orient="vertical", command=lb.yview)
+            lb.config(yscrollcommand=sb.set)
+            lb.pack(side="left")
+            sb.pack(side="left", fill="y")
+            ttk.Label(cell, foreground="#666666",
+                      text="Type to search, click a font to choose it.\n"
+                           "Empty = same as the Font setting."
+                      ).pack(anchor="w", pady=(2, 0))
+
+            def refill(*_a):
+                if self._picking:
+                    return
+                q = var.get().strip().lower()
+                lb.delete(0, "end")
+                for f in self.font_names:
+                    if q in f.lower():
+                        lb.insert("end", f)
+                cur = var.get().strip().lower()
+                for i in range(lb.size()):
+                    if lb.get(i).lower() == cur:
+                        lb.selection_set(i)
+                        lb.see(i)
+                        break
+
+            def pick(_e=None):
+                sel = lb.curselection()
+                if sel:
+                    self._picking = True
+                    try:
+                        var.set(lb.get(sel[0]))
+                    finally:
+                        self._picking = False
+
+            lb.bind("<<ListboxSelect>>", pick)
+            var.trace_add("write", refill)
+            refill()
         else:
             ttk.Entry(frame, textvariable=var, width=30).grid(
                 row=r, column=1, sticky="w")
@@ -736,6 +979,8 @@ class SettingsWindow:
             return
         spec = SPEC_BY_KEY[key]
         val = validate(spec, self.vars[key].get())
+        if val is not None and spec[3] == "font" and val and self.font_lower:
+            val = self.font_lower.get(val.lower())   # only real fonts apply
         if val is None:                      # half-typed or junk: ignore
             return
         set_value(key, val)
@@ -804,9 +1049,18 @@ class Overlay:
         self.busy = False
         self.settings_win = None
         self._focus_job = None
-        self.known_tags = set()
+        self.font_tags = {}                 # text tag -> (family, bold, color)
+        self.anims = []                     # animated GIFs now in the chat
+        self.full_anims = []                # ...and in full-size viewers
         self.presence = Presence()
         self.last_ping = 0
+        self.start_time = time.time()      # first-join roll call
+        self.ready_at = None
+        self.roll_sent = 0
+        self.roll_done = False
+        self.last_reply = 0
+        self.reply_seq = 0
+        self.update_info = None            # newer version found on GitHub
 
         if root.tk.call("tk", "windowingsystem") == "aqua":
             # Aqua treats overrideredirect windows as non-activating and
@@ -830,6 +1084,8 @@ class Overlay:
         self.menu = tk.Menu(root, tearoff=0)
         self.menu.add_command(label="Settings...",
                               command=self.open_settings)
+        self.menu.add_command(label="Check for updates",
+                              command=self.update_cmd)
         self.menu.add_command(label="Quit", command=root.destroy)
         for b in ("<Button-2>", "<Button-3>"):
             self.pill.bind(b, lambda e: self.menu.tk_popup(e.x_root, e.y_root))
@@ -849,10 +1105,13 @@ class Overlay:
                                      fg=MUTED, cursor="hand2", font=F(-2))
         self.settings_lbl.pack(side="right", padx=6)
         self.settings_lbl.bind("<Button-1>", lambda e: self.open_settings())
-        self.online_lbl = tk.Label(self.header, text="1 online", bg=BAR,
+        self.online_lbl = tk.Label(self.header, text="checking...", bg=BAR,
                                    fg=MUTED, cursor="hand2", font=F(-2))
         self.online_lbl.pack(side="right", padx=6)
         self.online_lbl.bind("<Button-1>", lambda e: self.show_who())
+        self.update_lbl = tk.Label(self.header, text="", bg=BAR,
+                                   fg="#7be08a", cursor="hand2", font=F(-2))
+        self.update_lbl.bind("<Button-1>", lambda e: self.update_cmd())
         for w in (self.header, self.title):
             w.bind("<ButtonPress-1>", self._drag_start)
             w.bind("<B1-Motion>", self._drag_move)
@@ -888,6 +1147,7 @@ class Overlay:
         self.set_state("collapsed")
         self.root.after(100, self.poll)
         self.root.after(500, self.tick)
+        self.root.after(60, self._animate)
 
     # ---- geometry / state
     def _place(self, w, h):
@@ -963,14 +1223,30 @@ class Overlay:
         self.entry_wrap.config(bg=BAR)
         self.plus.config(bg=BAR, fg=FG, font=F(3, True))
         self.entry.config(bg=BAR, fg=FG, insertbackground=FG, font=F())
-        for tag in self.known_tags:
-            self.text.tag_config(tag, font=F(0, True))
+        for tag, (fam, bold, color) in self.font_tags.items():
+            self._config_tag(tag, fam, bold, color)
         for m in self.history:               # thumbnails may change size
             m.pop("_photo", None)
+            m.pop("_anim", None)
         self.anchor_x = ANCHOR_X
         self.anchor_bottom = self.root.winfo_screenheight() - BOTTOM_MARGIN
         self._geometry()
         self.redraw()
+
+    def _config_tag(self, tag, family, bold, color):
+        font = (family, max(6, FONT_SIZE)) + (("bold",) if bold else ())
+        opts = {"font": font}
+        if color:
+            opts["foreground"] = color
+        self.text.tag_config(tag, **opts)
+
+    def _font_tag(self, family, bold=False, color=None, name=""):
+        """A text tag that draws in one person's chosen font."""
+        tag = ("n_" if bold else "t_") + name + "|" + family
+        if tag not in self.font_tags:
+            self.font_tags[tag] = (family, bold, color)
+            self._config_tag(tag, family, bold, color)
+        return tag
 
     def open_settings(self):
         if self.settings_win is not None:
@@ -995,10 +1271,120 @@ class Overlay:
         return [f"{self.net.name} (you)"] + others
 
     def update_online(self):
-        self.online_lbl.config(text=f"{len(self.online_names())} online")
+        n = len(self.online_names())
+        if n == 1 and not self.roll_done:
+            text = "checking..."           # still asking who's here
+        else:
+            text = f"{n} online"
+        if self.online_lbl.cget("text") != text:
+            self.online_lbl.config(text=text)
+
+    def _reply_roll(self):
+        """Someone joined or asked who's here: answer so they can list us.
+        A small random delay stops everyone answering in the same instant."""
+        now = time.time()
+        if now - self.last_reply < 1.5:
+            return
+        self.last_reply = now
+        top = 2000 if self.net.mode == "online" else 250
+        self.reply_seq += 1
+        seq = self.reply_seq
+
+        def go():
+            if seq != self.reply_seq:        # someone else already answered
+                return
+            roster = [{"uid": u, "name": n} for u, (n, _t)
+                      in list(self.presence.peers.items())[:40]]
+            self.net.send("", kind="ping", extra={"roster": roster})
+        self.root.after(random.randint(0, top), go)
+
+    # ---- updates
+    def start_update_check(self):
+        if not CHECK_UPDATES:
+            return
+        threading.Thread(target=self._update_worker, args=(False,),
+                         daemon=True).start()
+
+    def _update_worker(self, manual):
+        try:
+            info = check_for_update()
+        except Exception:
+            if manual:
+                self.inbox.put({"type": "sys", "name": "", "text":
+                                "couldn't check for updates (no internet "
+                                "or GitHub is busy)"})
+            return
+        if info:
+            self.inbox.put({"type": "update_found", "info": info})
+        elif manual:
+            self.inbox.put({"type": "sys", "name": "", "text":
+                            f"you're up to date (v{VERSION})"})
+
+    def _install_worker(self, info):
+        try:
+            ver = install_update(info)
+            self.inbox.put({"type": "update_done", "version": ver})
+        except Exception as ex:
+            log("update failed: " + traceback.format_exc())
+            self.inbox.put({"type": "sys", "name": "", "text":
+                            f"update failed ({str(ex)[:60]}); nothing "
+                            "was changed"})
+
+    def update_cmd(self):
+        """Menu, header link, or /update."""
+        if self.update_info is None:
+            self.note("checking for updates...")
+            threading.Thread(target=self._update_worker, args=(True,),
+                             daemon=True).start()
+            return
+        from tkinter import messagebox
+        info = self.update_info
+        self.busy = True
+        try:
+            ok = messagebox.askyesno(
+                "Study chat",
+                f"Update from v{VERSION} to v{info['version']}?\n\n"
+                f"This downloads the new studychat.py from GitHub "
+                f"({UPDATE_REPO}) and replaces this file. Your old copy is "
+                "kept as studychat.py.bak.", parent=self.root)
+        finally:
+            self.busy = False
+        if ok:
+            self.note("downloading update...")
+            threading.Thread(target=self._install_worker, args=(info,),
+                             daemon=True).start()
+
+    def _on_update_done(self, ver):
+        from tkinter import messagebox
+        self.update_info = None
+        self.update_lbl.pack_forget()
+        self.busy = True
+        try:
+            again = messagebox.askyesno(
+                "Study chat", f"Updated to v{ver}. Restart now?",
+                parent=self.root)
+        finally:
+            self.busy = False
+        if not again:
+            self.note(f"updated to v{ver}; it takes effect next time you "
+                      "start the chat")
+            return
+        args = [sys.executable, os.path.abspath(__file__),
+                "--name", self.net.name, "--room", self.net.room,
+                "--online" if self.net.mode == "online" else "--lan"]
+        try:
+            subprocess.Popen(args)
+            self.root.destroy()
+        except Exception:
+            self.note("couldn't restart by itself; please close and reopen")
 
     def show_who(self):
         self.note("Online: " + ", ".join(self.online_names()))
+
+    def show_who_popup(self):
+        """On joining, list who's here (and pop the window open briefly)."""
+        self._deliver({"type": "sys", "name": "", "text":
+                       "Online: " + ", ".join(self.online_names())})
 
     def _on_text_click(self, e):
         if any(tag.startswith("img_") for tag in
@@ -1034,6 +1420,76 @@ class Overlay:
             save_settings()
 
     # ---- images
+    def _pil_photo(self, im):
+        if ImageTk is not None:
+            return ImageTk.PhotoImage(im)
+        b = io.BytesIO()
+        im.convert("RGBA").save(b, "PNG")
+        return self.tk.PhotoImage(master=self.root,
+                                  data=base64.b64encode(b.getvalue()))
+
+    def make_anim(self, data, max_w, max_h):
+        """Frames for an animated GIF, or None if it isn't animated."""
+        if not data.startswith(b"GIF8"):
+            return None
+        frames, delays = [], []
+        try:
+            if PIL_OK:
+                im = Image.open(io.BytesIO(data))
+                n = getattr(im, "n_frames", 1)
+                if n < 2 or n > MAX_GIF_FRAMES:
+                    return None
+                for k in range(n):
+                    im.seek(k)
+                    fr = im.convert("RGBA")
+                    fr.thumbnail((max_w, max_h))
+                    frames.append(self._pil_photo(fr))
+                    delays.append(max(20, int(im.info.get("duration", 100))))
+            else:
+                b64 = base64.b64encode(data)
+                k = 0
+                while k <= MAX_GIF_FRAMES:
+                    try:
+                        frames.append(self.tk.PhotoImage(
+                            master=self.root, data=b64,
+                            format=f"gif -index {k}"))
+                    except self.tk.TclError:
+                        break
+                    k += 1
+                if len(frames) < 2 or k > MAX_GIF_FRAMES:
+                    return None
+                f = max(1, -(-frames[0].width() // max_w),
+                        -(-frames[0].height() // max_h))
+                if f > 1:
+                    frames = [p.subsample(f) for p in frames]
+                dl = gif_delays(data)
+                delays = [dl[i] if i < len(dl) else 100
+                          for i in range(len(frames))]
+            disp = self.tk.PhotoImage(master=self.root)
+            self.root.tk.call(str(disp), "copy", str(frames[0]))
+            return {"disp": disp, "frames": frames, "delays": delays,
+                    "i": 0, "next": time.time() + delays[0] / 1000}
+        except Exception:
+            log("make_anim failed: " + traceback.format_exc())
+            return None
+
+    def _animate(self):
+        try:
+            now = time.time()
+            if self.state != "collapsed":
+                self.full_anims[:] = [a for a in self.full_anims
+                                      if a["widget"].winfo_exists()]
+                for a in self.anims + self.full_anims:
+                    if now >= a["next"]:
+                        a["i"] = (a["i"] + 1) % len(a["frames"])
+                        self.root.tk.call(str(a["disp"]), "copy",
+                                          str(a["frames"][a["i"]]))
+                        a["next"] = now + a["delays"][a["i"]] / 1000
+        except Exception:
+            log("animate failed: " + traceback.format_exc())
+        finally:
+            self.root.after(30, self._animate)
+
     def make_photo(self, data, max_w, max_h):
         try:
             if PIL_OK:
@@ -1052,7 +1508,9 @@ class Overlay:
 
     def open_full(self, data):
         sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
-        photo = self.make_photo(data, int(sw * 0.8), int(sh * 0.8))
+        anim = self.make_anim(data, int(sw * 0.8), int(sh * 0.8))
+        photo = anim["disp"] if anim else self.make_photo(
+            data, int(sw * 0.8), int(sh * 0.8))
         if photo is None:
             return
         top = self.tk.Toplevel(self.root)
@@ -1062,6 +1520,9 @@ class Overlay:
         lbl = self.tk.Label(top, image=photo, bg=BG, cursor="hand2")
         lbl.image = photo
         lbl.pack()
+        if anim:
+            anim["widget"] = lbl
+            self.full_anims.append(anim)
 
         def close(_e=None):
             top.destroy()
@@ -1107,9 +1568,26 @@ class Overlay:
         self.push_image(data)
         return True
 
+    def send_gif(self, data):
+        """Send a GIF as it is, so it keeps moving. Too big? Shrink it."""
+        if len(data) > MAX_IMAGE_BYTES:
+            data = shrink_gif(data, MAX_IMAGE_BYTES)
+            if data is None:
+                self.note("that GIF is too big to send"
+                          + ("" if PIL_OK else
+                             " (install Pillow so it can be shrunk)"))
+                return False
+        self.push_image(data)
+        return True
+
     def send_file(self, path):
         path = path.strip().strip('"').strip("'")
         try:
+            with open(path, "rb") as f:
+                head = f.read(8)
+                if head.startswith(b"GIF8"):
+                    f.seek(0)
+                    return self.send_gif(f.read(40 * 1024 * 1024))
             if PIL_OK:
                 return self.send_pil(Image.open(path))
             with open(path, "rb") as f:
@@ -1123,6 +1601,29 @@ class Overlay:
             return False
         self.push_image(data)
         return True
+
+    def send_gif_link(self, url):
+        """/gif <direct link to a .gif file>"""
+        if not url.lower().startswith(("http://", "https://")):
+            self.note("use:  /gif https://.../funny.gif  (a direct link; on "
+                      "most sites, right-click the GIF and copy image address)")
+            return
+        self.note("fetching GIF...")
+
+        def work():
+            try:
+                data = _http_get(url, timeout=20, limit=30 * 1024 * 1024)
+            except Exception:
+                self.inbox.put({"type": "sys", "name": "", "text":
+                                "couldn't download that link"})
+                return
+            if not data.startswith(b"GIF8"):
+                self.inbox.put({"type": "sys", "name": "", "text":
+                                "that link isn't a GIF file (it needs to end "
+                                "in .gif, not be a web page)"})
+                return
+            self.inbox.put({"type": "gif_ready", "data": data})
+        threading.Thread(target=work, daemon=True).start()
 
     def pick_image(self):
         from tkinter import filedialog
@@ -1194,6 +1695,14 @@ class Overlay:
         t.config(state="normal")
         t.delete("1.0", "end")
         msgs = self.history[-(POPUP_LINES if self.state == "popup" else MAX_HISTORY):]
+        self.anims = []
+        gifs = [m for m in msgs if m.get("type") == "img"
+                and isinstance(m.get("data"), bytes)
+                and m["data"].startswith(b"GIF8")]
+        live = {id(m) for m in gifs[-LIVE_GIFS:]}     # older ones hold still
+        for m in gifs:
+            if id(m) not in live:
+                m.pop("_anim", None)
         for m in msgs:
             kind = m.get("type")
             if kind in ("join", "leave"):
@@ -1203,20 +1712,27 @@ class Overlay:
             if kind == "sys":
                 t.insert("end", m.get("text", "") + "\n", "sys")
                 continue
-            tag = "n_" + m["name"]
-            if tag not in self.known_tags:
-                t.tag_config(tag, foreground=name_color(m["name"]),
-                             font=F(0, True))
-                self.known_tags.add(tag)
+            if m.get("uid") == self.net.uid:      # mine: always my current font
+                fam = MY_FONT or FONT_FAMILY
+            else:                                 # theirs: the font they chose
+                fam = m.get("font") or FONT_FAMILY
+            tag = self._font_tag(fam, True, name_color(m["name"]), m["name"])
+            ttag = self._font_tag(fam)
             t.insert("end", m["name"] + ": ", tag)
             if kind == "img" and isinstance(m.get("data"), bytes):
-                if "_photo" not in m:
+                if id(m) in live and "_anim" not in m:
+                    m["_anim"] = self.make_anim(m["data"], THUMB_W, THUMB_H)
+                anim = m.get("_anim") if id(m) in live else None
+                if anim:
+                    self.anims.append(anim)
+                elif "_photo" not in m:
                     m["_photo"] = self.make_photo(m["data"], THUMB_W, THUMB_H)
+                shown = anim["disp"] if anim else m.get("_photo")
                 t.insert("end", "\n")
-                if m["_photo"] is not None:
+                if shown is not None:
                     itag = "img_" + str(m.get("id"))
                     start = t.index("end-1c")
-                    t.image_create(start, image=m["_photo"], padx=2, pady=2)
+                    t.image_create(start, image=shown, padx=2, pady=2)
                     t.tag_add(itag, start, f"{start}+1c")
                     t.tag_bind(itag, "<Button-1>",
                                lambda e, d=m["data"]: self.open_full(d))
@@ -1228,7 +1744,7 @@ class Overlay:
                     t.insert("end", "(image couldn't be shown)", "sys")
                 t.insert("end", "\n")
             else:
-                t.insert("end", m.get("text", "") + "\n")
+                t.insert("end", m.get("text", "") + "\n", ttag)
         t.config(state="disabled")
         t.see("end")
 
@@ -1251,10 +1767,20 @@ class Overlay:
         if text == "/who":
             self.show_who()
             return
+        if text in ("/update", "/version"):
+            if text == "/version":
+                self.note(f"studychat v{VERSION}")
+            self.update_cmd()
+            return
         if text.startswith("/img "):
             self.send_file(text[5:])
             return
-        self.add(self.net.send(text))
+        if text.startswith("/gif "):
+            self.send_gif_link(text[5:].strip())
+            return
+        self.add(self.net.send(text, extra={"font": MY_FONT}
+                               if MY_FONT else None))
+        self.last_ping = time.time()        # a message already says "here"
         self.redraw()
 
     # ---- loops
@@ -1280,12 +1806,44 @@ class Overlay:
         if msg.get("type") == "summon":
             self.set_state("active")
             return
+        if msg.get("type") == "update_found":
+            info = msg.get("info") or {}
+            if self.update_info is None and info.get("version"):
+                self.update_info = info
+                self.update_lbl.config(text=f"update v{info['version']}")
+                self.update_lbl.pack(side="right", padx=6)
+                self._deliver({"type": "sys", "name": "", "text":
+                               f"Update available: v{info['version']} "
+                               f"(you have v{VERSION}). Click \"update\" in "
+                               "the top bar or type /update."})
+            return
+        if msg.get("type") == "gif_ready":
+            self.send_gif(msg["data"])
+            return
+        if msg.get("type") == "update_done":
+            self._on_update_done(str(msg.get("version", "")))
+            return
         msg["name"] = str(msg.get("name", "?"))[:20]
         msg["text"] = str(msg.get("text", ""))[:2000]
+        msg["font"] = re.sub(r"[^\w .\-]", "", str(msg.get("font", "")))[:40].strip()
         self.presence.seen(msg, time.time())
-        if msg.get("type") == "join" and msg.get("uid") != self.net.uid:
-            # say hi back right away so the newcomer sees who's here
-            self.net.send("", kind="ping")
+        roster = msg.get("roster")
+        if (msg.get("type") == "ping" and isinstance(roster, list)
+                and msg.get("uid") != self.net.uid):
+            self.reply_seq += 1              # they answered, so we needn't
+            if not self.roll_done:           # newcomer: learn who else is here
+                for it in roster[:50]:
+                    if not isinstance(it, dict):
+                        continue
+                    u, n = it.get("uid"), str(it.get("name", "?"))[:20]
+                    if (isinstance(u, str) and u and u != self.net.uid
+                            and u not in self.presence.peers):
+                        self.presence.peers[u] = (n, time.time())
+        if msg.get("uid") != self.net.uid and (
+                msg.get("type") == "join"
+                or (msg.get("type") == "ping" and msg.get("text") == "who")):
+            # say hi back so the newcomer sees who's here
+            self._reply_roll()
         if msg.get("type") == "ping":          # quiet "still here" signal
             return
         self._deliver(msg)
@@ -1310,6 +1868,23 @@ class Overlay:
                     "slowed the app down)")
                 self.presence.refresh_all(now)
                 self.last_ping = 0
+            # first-join roll call: ask who's here (again if nobody answered)
+            if self.ready_at is None and getattr(self.net, "connected", True):
+                self.ready_at = now
+            if self.ready_at is not None and not self.roll_done:
+                waited = now - self.ready_at
+                alone = len(self.presence.peers) == 0
+                if (alone and self.roll_sent < (2 if self.net.mode == "online" else 3)
+                        and waited >= (0.3, 3.0, 8.0)[self.roll_sent]):
+                    self.roll_sent += 1
+                    self.net.send("who", kind="ping")
+                if waited > 3.5:
+                    self.roll_done = True
+                    self.update_online()
+                    self.show_who_popup()
+            if not self.roll_done and now - self.start_time > 15:
+                self.roll_done = True               # offline: stop waiting
+                self.update_online()
             # tell others we're still here, and notice when someone stops
             if now - self.last_ping > self.net.ping_every:
                 self.last_ping = now
@@ -1398,6 +1973,7 @@ def main():
         pass
     net.send("joined", kind="join")
     overlay.add({"type": "join", "name": "You", "text": ""})
+    overlay.start_update_check()
     try:
         root.mainloop()
     except KeyboardInterrupt:
