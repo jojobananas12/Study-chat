@@ -3,9 +3,13 @@
     python3 -m unittest discover -s tests -v
 
 The windows are local test fixtures; no network or settings files are used.
+On X11, install xdotool to also verify native keyboard input (use a test
+display such as Xvfb to keep injected keys isolated from your desktop).
 """
 
 import queue
+import shutil
+import subprocess
 import time
 import unittest
 from unittest.mock import Mock
@@ -32,7 +36,7 @@ class FocusTests(unittest.TestCase):
 
     def tearDown(self):
         for job in self.root.tk.call("after", "info"):
-            self.root.after_cancel(job)
+            self.root.tk.call("after", "cancel", job)
         self.root.destroy()
 
     def pump(self):
@@ -78,6 +82,74 @@ class FocusTests(unittest.TestCase):
         self.click(self.overlay.text)
         self.assertEqual(self.overlay.state, "active")
         self.assert_can_type()
+
+    def test_x11_window_stays_managed_across_state_changes(self):
+        if self.root.tk.call("tk", "windowingsystem") != "x11":
+            self.skipTest("requires X11 or XWayland")
+        self.assertFalse(self.root.overrideredirect())
+        self.overlay._deliver({"type": "text", "name": "Friend",
+                               "text": "Hello"})
+        self.pump()
+        self.assertFalse(self.root.overrideredirect())
+        self.click(self.overlay.text)
+        self.assertFalse(self.root.overrideredirect())
+        self.assertEqual(self.root.winfo_width(), studychat.WIDTH)
+        self.assertEqual(self.root.winfo_height(), studychat.ACTIVE_HEIGHT)
+        self.assert_can_type()
+        # Closing the native title bar should return to the Chat button.
+        self.root.tk.eval(self.root.protocol("WM_DELETE_WINDOW"))
+        self.pump()
+        self.assertEqual(self.overlay.state, "collapsed")
+        self.assertFalse(self.root.overrideredirect())
+        self.click(self.overlay.pill)
+        self.assertFalse(self.root.overrideredirect())
+        self.assertEqual(self.root.winfo_width(), studychat.WIDTH)
+        self.assertEqual(self.root.winfo_height(), studychat.ACTIVE_HEIGHT)
+        self.assert_can_type()
+
+    @unittest.skipUnless(shutil.which("xdotool"),
+                         "requires xdotool for native X11 keyboard input")
+    def test_x11_native_typing_and_sending_after_reopen(self):
+        if self.root.tk.call("tk", "windowingsystem") != "x11":
+            self.skipTest("requires X11 or XWayland")
+        # A separate Tk application is essential: another Toplevel in the
+        # same application can route keys internally and conceal this bug.
+        other_root = tk.Tk()
+        self.addCleanup(other_root.destroy)
+        other = tk.Entry(other_root)
+        other.pack()
+        for state in ("collapsed", "popup", "collapsed"):
+            self.overlay.set_state(state)
+            self.pump()
+            other.focus_force()
+            self.pump()
+            self.click(self.overlay.text if state == "popup"
+                       else self.overlay.pill)
+            # Do not target a widget/window: send to the server's actual
+            # keyboard focus. Tk can report focus while X11 sends keys away.
+            subprocess.run(["xdotool", "type", "--clearmodifiers",
+                            "--delay", "0", "hello"], check=True)
+            self.pump()
+            self.assertEqual(self.overlay.entry.get(), "hello")
+            self.overlay.entry.delete(0, "end")
+            other.focus_force()
+            self.pump()
+            self.click(self.overlay.entry)
+            subprocess.run(["xdotool", "type", "--clearmodifiers",
+                            "--delay", "0", "again"], check=True)
+            self.pump()
+            self.assertEqual(self.overlay.entry.get(), "again")
+            self.overlay.net.send.return_value = {
+                "type": "text", "name": "Tester", "text": "again"}
+            self.overlay.net.send.reset_mock()
+            subprocess.run(["xdotool", "key", "Return"], check=True)
+            self.pump()
+            self.overlay.net.send.assert_called_once_with("again")
+            self.assertEqual(self.overlay.entry.get(), "")
+            self.assertEqual(other.get(), "")
+            subprocess.run(["xdotool", "key", "Escape"], check=True)
+            self.pump()
+            self.assertEqual(self.overlay.state, "collapsed")
 
     def test_repeated_reopen_and_return_from_other_window(self):
         other = self.other_input()

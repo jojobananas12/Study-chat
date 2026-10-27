@@ -808,12 +808,22 @@ class Overlay:
         self.presence = Presence()
         self.last_ping = 0
 
-        if root.tk.call("tk", "windowingsystem") == "aqua":
+        windowing_system = root.tk.call("tk", "windowingsystem")
+        if windowing_system == "aqua":
             # Aqua treats overrideredirect windows as non-activating and
             # ignores their focus requests. Hide the title bar while keeping
             # a normal window that macOS can give keyboard focus to.
             root.tk.call("tk::unsupported::MacWindowStyle", "style",
                          root._w, "document", ("noTitleBar",))
+        elif windowing_system == "x11":
+            # X11 Tk refuses keyboard focus for override-redirect windows.
+            # Keep this window managed on both X11 and XWayland so clicks
+            # can activate it and route keyboard input to the entry.
+            root.overrideredirect(False)
+            root.resizable(False, False)
+            root.title("Study chat")
+            root.protocol("WM_DELETE_WINDOW",
+                          lambda: self.set_state("collapsed"))
         else:
             root.overrideredirect(True)
         root.attributes("-topmost", True)
