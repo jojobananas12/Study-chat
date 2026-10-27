@@ -81,8 +81,8 @@ BG = "#14161c"           # chat background
 BAR = "#1d2029"          # top bar and text box color
 FG = "#e8e8e8"           # message text color
 MUTED = "#8a90a0"        # faded text color
-FONT_FAMILY = "Segoe UI"
-FONT_SIZE = 10
+FONT_FAMILY = "Papyrus"
+FONT_SIZE = 14
 
 # --- Window
 WIDTH = 360
