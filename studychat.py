@@ -50,6 +50,20 @@ School wifi:
     must pick the same mode. Online mode is NOT private, so use a long,
     hard-to-guess room name.
 
+Online games:
+  - Both players need this version for online Duel. Combat choices and
+    animation stay local; the relay carries three messages per shared turn.
+  - Sends are paced across the people known in the room. Other devices on
+    the same public IP may share ntfy's allowance, so this is an estimate.
+  - Failed sends can be retried with /retry or the game's Retry send button.
+    A locked move never changes during retries. Interrupted duels can be
+    cancelled without a result.
+  - A confirmed daily quota limit pauses publishing until midnight UTC.
+    Local usage counts (not remaining quota) are stored in .studychat-net-*.json
+    in your home folder. No messages or tokens are stored there.
+  - Network settings include burst, refill interval and daily usage warning
+    allowance for custom relays. A token does not automatically raise limits.
+
 Links in messages are clickable (Instagram links open the small reels
   window). Select chat text with the mouse and press Ctrl+C (Cmd+C on a
   Mac) to copy it, or right-click a line or link for a copy menu.
@@ -60,6 +74,7 @@ Commands: /disconnect (or /quit), /getfonts (install the free fonts your friends
   Edge or Brave, or pywebview), /reelgif (send a GIF of the reel; same as
   the "gif" button, "/reelgif area" picks the screen area again),
   /duel (challenge the room to a tiny fighting game),
+  /retry (retry failed online sends without changing locked game choices),
   /who (who's online), /update (check for a new version),
   /version, /settings, /img, /quit. The chat checks GitHub for a newer
   version when it starts; set STUDYCHAT_NO_UPDATE=1 to turn that off.
@@ -183,6 +198,9 @@ PORT = 50555             # same-wifi mode (everyone must match)
 RELAY_URL = "https://ntfy.sh"   # online mode
 WIFI_PING_EVERY = 20     # seconds between "I'm still here" signals
 ONLINE_PING_EVERY = 240
+RELAY_BURST = 12         # working request budget, shared with known room members
+RELAY_REFILL_SECONDS = 5 # one request per interval, before sharing/backoff
+RELAY_DAILY_LIMIT = 250  # usage warning only; the server enforces its real quota
 
 PALETTE = ["#5aa9ff", "#ff7a7a", "#7be08a", "#ffd166", "#c792ea",
            "#4dd0e1", "#ffab70", "#f48fb1"]
@@ -242,6 +260,13 @@ SPEC = [
      "int", 15, 300),
 ]
 SPEC_BY_KEY = {s[1]: s for s in SPEC}
+SPEC += [
+    ("Network", "RELAY_BURST", "Relay working request burst", "int", 1, 60),
+    ("Network", "RELAY_REFILL_SECONDS", "Relay request refill (seconds)",
+     "float", 0.1, 60),
+    ("Network", "RELAY_DAILY_LIMIT", "Relay daily allowance (usage warning)",
+     "int", 1, 100000),
+]
 DEFAULTS = {s[1]: globals()[s[1]] for s in SPEC}
 SETTINGS_PATH = os.path.join(os.path.expanduser("~"), ".studychat.json")
 
@@ -1475,7 +1500,7 @@ def duel_fg_rects(fr, fx, phase, goal=None):
 # ---------------------------------------------------------------- networking
 # Quiet "ping" messages that carry one of these are real requests (a game
 # move, a font file...), so the relay must retry them, never drop them.
-LOUD_KEYS = ("items", "flip", "game", "duel", "fontreq", "blob")
+LOUD_KEYS = ("items", "flip", "game", "duel", "duel2", "fontreq", "blob")
 
 
 class Net:
@@ -1661,6 +1686,8 @@ class Net:
                 continue
             if msg.get("app") != "studychat" or msg.get("room") != self.room:
                 continue
+            if msg.get("type") == "delivery":
+                continue                  # delivery receipts are local, never wire messages
             mid = msg.get("id")
             if not mid or mid in self.seen:   # own echo or duplicate packet
                 continue
@@ -1704,6 +1731,307 @@ class Net:
         self.inbox.put(msg)
 
 
+@dataclass
+class RelayJob:
+    msg: dict
+    data: object
+    born: float
+    due: float
+    priority: int
+    game: str = ""
+    coalesce: str = ""
+    ttl: float = 300
+    tries: int = 0
+    state: str = "queued"
+    note: str = ""
+
+
+class RelayOutbox:
+    """Publication scheduling, separate from HTTP and Tk for headless tests.
+
+    A successful POST means cached at ntfy, not received by the opponent.
+    Only this queue retries publications; games never retry successful sends.
+    All times used for scheduling are monotonic. UTC is only for daily usage.
+    """
+
+    def __init__(self, inbox, usage_path=None, clock=time.monotonic,
+                 wall=time.time, jitter=random.uniform):
+        self.inbox, self.usage_path = inbox, usage_path
+        self.clock, self.wall, self.jitter = clock, wall, jitter
+        self.lock = threading.RLock()
+        self.jobs = {}
+        self.receipts = set()
+        self.members, self.penalty = 1, 1
+        self.tokens, self.refilled = float(RELAY_BURST), clock()
+        self.cool_until = self.last_throttle = self.recovered = 0
+        self.read_until = 0
+        self.cool_n = 0
+        self.last_published = 0
+        self.day, self.count, self.quota_until = int(wall() // 86400), 0, 0
+        self.warned = False
+        if usage_path:
+            try:
+                with open(usage_path, encoding="utf-8") as f:
+                    saved = json.load(f)
+                if saved.get("day") == self.day:
+                    self.count = max(0, int(saved.get("count", 0)))
+                    self.quota_until = min((self.day + 1) * 86400,
+                                           float(saved.get("quota_until", 0)))
+            except (OSError, ValueError, TypeError, AttributeError):
+                pass
+
+    @staticmethod
+    def classify(msg):
+        g = msg.get("duel2") or msg.get("game") or {}
+        if not isinstance(g, dict):
+            g = {}
+        terminal = g.get("op") in ("quit", "cancel", "end")
+        if msg.get("type") == "leave" or terminal:
+            return 0, g.get("gid", ""), "", 120
+        if g:
+            return 2, g.get("gid", ""), "", 1800 if "duel2" in msg else 900
+        if msg.get("type") == "join":
+            return 1, "", "join", 300
+        if any(k in msg for k in ("items", "fontreq", "blob")):
+            return 3, "", "", 300
+        if msg.get("type") == "ping" and not any(k in msg for k in LOUD_KEYS):
+            key = ("who" if msg.get("text") == "who" else
+                   "roster" if "roster" in msg else
+                   "fontlist" if "fontlist" in msg else "keepalive")
+            return 4, "", key, 30 if key in ("who", "roster") else 600
+        return 1, "", "", 300
+
+    def _event(self, job, state, note=""):
+        if (job.state, job.note) == (state, note):
+            return
+        job.state, job.note = state, note
+        if state in ("published", "cancelled"):
+            job.data = None
+        self.inbox.put({"type": "delivery", "id": job.msg["id"],
+                        "gid": job.game, "state": state, "text": note})
+
+    def _save(self):
+        if not self.usage_path:
+            return
+        tmp = self.usage_path + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({"day": self.day, "count": self.count,
+                           "quota_until": self.quota_until}, f)
+            os.replace(tmp, self.usage_path)
+        except OSError:
+            pass                         # usage is advisory; play still works
+
+    def _day(self):
+        day = int(self.wall() // 86400)
+        if day != self.day:
+            self.day, self.count, self.quota_until = day, 0, 0
+            self.warned = False
+            self.receipts.clear()
+            self._save()
+
+    def enqueue(self, msg, data=None):
+        with self.lock:
+            if msg["id"] in self.jobs:
+                return
+            priority, game, key, ttl = self.classify(msg)
+            for old in self.jobs.values():
+                if key and old.coalesce == key and old.state in ("queued", "delayed"):
+                    self._event(old, "cancelled")
+            # Retain recent completed jobs so late self echoes are recognized.
+            done = [mid for mid, j in self.jobs.items()
+                    if j.state in ("published", "cancelled") or
+                    (j.state == "failed" and not j.game)]
+            for mid in done[:-256]:
+                del self.jobs[mid]
+            now = self.clock()
+            job = RelayJob(msg, data, now, now, priority, game, key, ttl, state="new")
+            self.jobs[msg["id"]] = job
+            pending = sum(j.state not in ("published", "cancelled", "failed")
+                          for j in self.jobs.values())
+            self._event(job, "queued" if pending <= 256 else "failed",
+                        "" if pending <= 256 else "Send queue is full. Retry later.")
+
+    def set_members(self, members):
+        with self.lock:
+            self._refill()
+            self.members = max(1, min(100, members))
+            self.tokens = min(self.tokens, max(1, RELAY_BURST / self.members))
+
+    def _refill(self):
+        now = self.clock()
+        capacity = max(1, RELAY_BURST / self.members)
+        interval = RELAY_REFILL_SECONDS * self.members * self.penalty
+        self.tokens = min(capacity, self.tokens + max(0, now - self.refilled) / interval)
+        self.refilled = now
+
+    def _request_delay(self):
+        self._refill()
+        return max(0, self.cool_until - self.clock(),
+                   (1 - self.tokens) * RELAY_REFILL_SECONDS * self.members * self.penalty)
+
+    def reserve_read(self):
+        """New subscription/download requests share the request bucket, not quota."""
+        with self.lock:
+            delay = max(self._request_delay(), self.read_until - self.clock())
+            if not delay:
+                self.tokens -= 1
+            return delay
+
+    def take(self, connected=True):
+        with self.lock:
+            self._day()
+            now = self.clock()
+            waiting = []
+            blocked_games = set()
+            for job in self.jobs.values():
+                if job.state in ("published", "cancelled"):
+                    continue
+                if job.state == "failed":
+                    if job.game:
+                        blocked_games.add(job.game)
+                    continue
+                if now - job.born > job.ttl:
+                    self._event(job, "cancelled" if job.priority == 4 else "failed",
+                                "Message expired before it could be sent.")
+                    if job.game:
+                        blocked_games.add(job.game)
+                    continue
+                blocked = job.game and job.game in blocked_games and job.priority != 0
+                if job.game:
+                    blocked_games.add(job.game)
+                if job.state == "sending" or blocked:
+                    continue
+                if self.quota_until > self.wall():
+                    self._event(job, "delayed", "Daily relay quota reached; resumes at 00:00 UTC.")
+                elif job.game and not connected:
+                    self._event(job, "delayed", "Waiting for the relay connection.")
+                elif job.due <= now:
+                    waiting.append(job)
+            if not waiting:
+                return None
+            job = min(waiting, key=lambda j: (j.priority, j.born))
+            if self._request_delay():
+                self._event(job, "delayed", "Relay pacing: waiting to send.")
+                return None
+            self.tokens -= 1
+            self._event(job, "sending")
+            return job
+
+    def published(self, mid, receipt=None):
+        with self.lock:
+            job = self.jobs.get(mid)
+            if not job:
+                return
+            self._day()
+            receipt = receipt or mid
+            if receipt not in self.receipts:
+                self.receipts.add(receipt)
+                self.count += 1
+                self.last_published = self.wall()
+                self._save()
+                if self.count >= max(1, int(RELAY_DAILY_LIMIT * .8)) and not self.warned:
+                    self.warned = True
+                    self.inbox.put({"type": "sys", "name": "", "text":
+                        f"This device has published {self.count} messages today. "
+                        "The relay allowance may be shared with other devices."})
+            if job.state != "cancelled":
+                self._event(job, "published")
+            now = self.clock()
+            if now - max(self.last_throttle, self.recovered) >= 60:
+                self.penalty = max(1, self.penalty / 2)
+                self.recovered = now
+                self.cool_n = 0
+
+    def throttle(self, code, retry_after=None):
+        with self.lock:
+            self._day()
+            if code == 42908:
+                was_limited = self.quota_until > self.wall()
+                self.quota_until = (self.day + 1) * 86400
+                self._save()
+                if not was_limited:
+                    self.inbox.put({"type": "sys", "name": "", "text":
+                        "Daily relay quota reached. Publishing resumes at 00:00 UTC; "
+                        "you can still receive messages."})
+                return
+            if code == 42905:
+                delay = retry_after if retry_after is not None else (
+                    (self.day + 1) * 86400 - self.wall())
+                self.read_until = max(self.read_until, self.clock() + delay)
+                return
+            now = self.clock()
+            self._refill()
+            self.cool_n = min(6, self.cool_n + 1)
+            if self.cool_n == 1:
+                self.inbox.put({"type": "sys", "name": "", "text":
+                    "Relay is busy. Sends are queued while it recovers."})
+            delay = (retry_after if retry_after is not None else
+                     min(300, 15 * 2 ** (self.cool_n - 1) * self.jitter(1, 1.2)))
+            self.cool_until = max(self.cool_until, now + delay)
+            self.last_throttle = now
+            self.penalty = min(8, self.penalty * 2)
+            self.tokens = 0
+
+    def failed(self, job, note, transient=True, limited=False):
+        with self.lock:
+            if job.state in ("published", "cancelled"):
+                return                    # an echo may have confirmed a lost HTTP response
+            if limited:
+                job.due = self.clock()
+                self._event(job, "delayed", note)
+            elif transient and job.tries < 3:
+                job.tries += 1
+                job.due = self.clock() + (5, 15, 30)[job.tries - 1] * self.jitter(1, 1.2)
+                self._event(job, "delayed", note)
+            else:
+                self._event(job, "cancelled" if job.priority == 4 else "failed", note)
+
+    def retry(self, mid):
+        with self.lock:
+            job = self.jobs.get(mid)
+            if job and job.state == "failed":
+                job.tries = 0
+                job.born = job.due = self.clock()
+                self._event(job, "queued")
+
+    def retry_failed(self):
+        with self.lock:
+            failed = [mid for mid, j in self.jobs.items() if j.state == "failed"]
+            for mid in failed:
+                self.retry(mid)
+            return len(failed)
+
+    def cancel_game(self, gid, keep_terminal=True):
+        with self.lock:
+            for job in self.jobs.values():
+                if (job.game == gid and (not keep_terminal or job.priority != 0)
+                        and job.state != "published"):
+                    self._event(job, "cancelled")
+
+
+def relay_error(ex, now):
+    """Read bounded ntfy error details and both legal Retry-After formats."""
+    try:
+        body = json.loads(ex.read(8192))
+        code = body.get("code") if isinstance(body, dict) else None
+    except (OSError, ValueError):
+        code = None
+    finally:
+        ex.close()
+    raw = ex.headers.get("Retry-After") if ex.headers else None
+    delay = None
+    if raw:
+        try:
+            delay = max(0, int(raw))
+        except ValueError:
+            try:
+                delay = max(0, email.utils.parsedate_to_datetime(raw).timestamp() - now)
+            except (TypeError, ValueError, OverflowError):
+                pass
+    return code, delay
+
+
 class RelayNet:
     """Online mode: messages go through a free public relay (ntfy.sh) over
     HTTPS, so it works on school wifi that stops laptops from seeing each
@@ -1722,11 +2050,7 @@ class RelayNet:
         # The free relay allows only a few posts per minute for everyone on
         # the same internet address, so keep background chatter rare.
         self.ping_every = max(ONLINE_PING_EVERY, 180)
-        self.cool_until = 0              # pause quiet signals after a 429
-        self.cool_n = 0                  # 429s in a row (longer pause each time)
-        self.deferred = {}               # quiet signals held back, to retry
         self.join_ok = False             # our "joined" reached the relay
-        self.held_note = False           # told the person about a slow relay
         self.token = os.environ.get("STUDYCHAT_TOKEN")   # ntfy account
         self.base = RELAY_URL.rstrip("/")
         self.topic = "sc-" + hashlib.sha256(
@@ -1736,7 +2060,12 @@ class RelayNet:
             self.ctx = ssl.create_default_context(cafile=certifi.where())
         except Exception:
             self.ctx = ssl.create_default_context()
-        self.sendq = queue.Queue()
+        scope = hashlib.sha256((self.base + "|" + (self.token or "anonymous"))
+                               .encode()).hexdigest()[:16]
+        usage_path = os.path.join(os.path.expanduser("~"),
+                                  f".studychat-net-{scope}.json")
+        self.outbox = RelayOutbox(inbox, usage_path)
+        self.stop = threading.Event()
         threading.Thread(target=self._sender, daemon=True).start()
         threading.Thread(target=self._subscribe, daemon=True).start()
 
@@ -1757,17 +2086,17 @@ class RelayNet:
         if extra:
             msg.update(extra)
         self.seen.add(msg["id"])
-        self.sendq.put((msg, None))
+        self.outbox.enqueue(msg)
         return msg
 
     def send_image(self, data, extra=None):
         msg = {"app": "studychat", "room": self.room, "id": uuid.uuid4().hex,
                "name": self.name, "text": "", "type": "img",
-               "size": len(data)}
+               "size": len(data), "uid": self.uid}
         if extra:
             msg.update(extra)
         self.seen.add(msg["id"])
-        self.sendq.put((msg, data))
+        self.outbox.enqueue(msg, data)
         return dict(msg, data=data)
 
     def send_blob(self, data, extra):
@@ -1777,130 +2106,94 @@ class RelayNet:
                "uid": self.uid, "size": len(data)}
         msg.update(extra)
         self.seen.add(msg["id"])
-        self.sendq.put((msg, data))
+        self.outbox.enqueue(msg, data)
         return msg
 
-    # Quiet signals (joined, who's here, still here) are not chat, but they
-    # are how people see each other. If the relay is busy they used to be
-    # thrown away, so nobody ever appeared. Now they are held and retried,
-    # and a newer signal of the same kind replaces an older one.
-    HOLD_FOR = {"join": 300, "ping:keepalive": 600, "ping:who": 30,
-                "ping:roster": 30, "ping:fontlist": 300}
-
-    @staticmethod
-    def _key(msg):
-        t = msg.get("type")
-        if t == "ping":
-            return "ping:" + ("who" if msg.get("text") == "who" else
-                              "roster" if "roster" in msg else
-                              "fontlist" if "fontlist" in msg else
-                              "keepalive")
-        return t
-
-    def _hold(self, msg, data, born, tries, fresh):
-        key = self._key(msg)
-        if key not in self.HOLD_FOR:
-            return                   # chat is never held
-        if key in self.deferred and not fresh:
-            return                   # a retry never replaces a newer signal
-        self.deferred.pop(key, None)
-        self.deferred[key] = (msg, data, born, tries)
-        if not self.held_note and key == "join":
-            self.held_note = True
-            log("join held back by the relay")
-            self._status("the chat server is busy, so others may not see "
-                         "you yet. Retrying...")
+    def _send_once(self):
+        job = self.outbox.take(self.connected)
+        if job is None:
+            return False
+        msg, data = job.msg, job.data
+        meta = json.dumps(msg, separators=(",", ":"))
+        url = f"{self.base}/{self.topic}"
+        if data is None:
+            body = meta.encode("utf-8")
+            if len(body) > 4096:
+                self.outbox.failed(job, "Message exceeds the relay's 4096-byte limit.", False)
+                return True
+            req = urllib.request.Request(url, data=body, method="POST")
+        else:
+            ext = ("png" if data.startswith(b"\x89PNG") else
+                   "gif" if data.startswith(b"GIF8") else
+                   "ttf" if msg.get("blob") == "font" else "jpg")
+            req = urllib.request.Request(url, data=data, method="PUT",
+                                         headers={"Filename": f"image.{ext}",
+                                                  "Message": meta})
+        try:
+            with self._open(req, 30) as resp:
+                raw = resp.read()
+            try:
+                receipt = json.loads(raw).get("id")
+            except (ValueError, AttributeError):
+                receipt = None
+            self.outbox.published(msg["id"], receipt)
+            if msg.get("type") == "join":
+                self.join_ok = True
+        except urllib.error.HTTPError as ex:
+            code, delay = relay_error(ex, time.time())
+            if ex.code == 429:
+                self.outbox.throttle(code, delay)
+            note = ("Daily relay quota reached; resumes at 00:00 UTC." if code == 42908
+                    else "Relay is busy; waiting to retry." if ex.code == 429
+                    else f"Message not sent (HTTP {ex.code}).")
+            self.outbox.failed(job, note, ex.code >= 500, ex.code == 429)
+            if code == 42905:
+                with self.outbox.lock:
+                    job.due = self.outbox.read_until
+        except (OSError, ValueError):
+            self.outbox.failed(job, "Connection interrupted; waiting to retry.")
+        return True
 
     def _sender(self):
-        url = f"{self.base}/{self.topic}"
-        while True:
-            from_queue = True
-            try:
-                msg, data = self.sendq.get(timeout=1)
-                born, tries = time.time(), 0
-            except queue.Empty:
-                # nothing new: retry a held-back signal once the relay allows
-                if not self.deferred or time.time() < self.cool_until:
-                    continue
-                key = next(iter(self.deferred))
-                msg, data, born, tries = self.deferred.pop(key)
-                from_queue = False
-                if time.time() - born > self.HOLD_FOR.get(key, 0):
-                    continue                     # too old to be useful
-            quiet = (msg.get("type") in ("ping", "join", "leave")
-                     # history, flips, game moves and font files must never
-                     # be dropped
-                     and not any(k in msg for k in LOUD_KEYS))
-            try:
-                if (quiet and msg.get("type") != "leave"
-                        and time.time() < self.cool_until):
-                    self._hold(msg, data, born, tries, from_queue)   # angry
-                    continue
-                meta = json.dumps(msg)           # one ASCII line
-                for attempt in range(4):
-                    if data is None:
-                        req = urllib.request.Request(
-                            url, data=meta.encode("utf-8"), method="POST")
-                    else:
-                        ext = ("png" if data.startswith(b"\x89PNG") else
-                               "gif" if data.startswith(b"GIF8") else
-                               "ttf" if msg.get("blob") == "font" else "jpg")
-                        req = urllib.request.Request(
-                            url, data=data, method="PUT",
-                            headers={"Filename": f"image.{ext}",
-                                     "Message": meta})
-                    try:
-                        self._open(req, 60).read()
-                        self.cool_n = 0
-                        if msg.get("type") == "join":
-                            self.join_ok = True
-                            if self.held_note:
-                                self.held_note = False
-                                self._status("connected: others can see "
-                                             "you now")
-                        break
-                    except urllib.error.HTTPError as ex:
-                        if ex.code == 429:
-                            self.cool_n += 1
-                            self.cool_until = time.time() + min(
-                                60, 15 * 2 ** (self.cool_n - 1))
-                        if ex.code != 429 or quiet or attempt == 3:
-                            raise
-                        # the relay says slow down: wait, then try again
-                        if attempt == 0:
-                            self._status("relay is busy, retrying...")
-                        time.sleep(5 * (attempt + 1))
-            except urllib.error.HTTPError as ex:
-                if quiet and msg.get("type") != "leave" and tries < 8:
-                    self._hold(msg, data, born, tries + 1, from_queue)
-                elif not quiet:
-                    self._status("relay is too busy, message not sent; "
-                                 "try again in a minute" if ex.code == 429
-                                 else f"message not sent (error {ex.code})")
-            except Exception:
-                if quiet and msg.get("type") != "leave" and tries < 8:
-                    self.cool_until = max(self.cool_until, time.time() + 5)
-                    self._hold(msg, data, born, tries + 1, from_queue)
-                elif not quiet:
-                    self._status("message not sent (is the internet "
-                                 "working?)")
-            finally:
-                if from_queue:
-                    self.sendq.task_done()
+        while not self.stop.is_set():
+            if not self._send_once():
+                self.stop.wait(.25)
+
+    def cancel_game(self, gid, keep_terminal=True):
+        self.outbox.cancel_game(gid, keep_terminal)
+
+    def retry(self, mid):
+        self.outbox.retry(mid)
 
     def close(self):
-        """Tell everyone we're leaving, and give it a moment to go out."""
         if self.closed:
             return
         self.closed = True
-        self.send("left", kind="leave")
-        waiter = threading.Thread(target=self.sendq.join, daemon=True)
-        waiter.start()
-        waiter.join(4)
+        leave = self.send("left", kind="leave")
+        deadline = time.monotonic() + 4
+        while time.monotonic() < deadline:
+            if self.outbox.jobs[leave["id"]].state in ("published", "failed"):
+                break
+            time.sleep(.05)
+        self.stop.set()
+
+    def _read_open(self, req, timeout):
+        while not self.stop.is_set():
+            delay = self.outbox.reserve_read()
+            if not delay:
+                try:
+                    return self._open(req, timeout)
+                except urllib.error.HTTPError as ex:
+                    if ex.code == 429:
+                        code, wait = relay_error(ex, time.time())
+                        self.outbox.throttle(code, wait)
+                    raise
+            self.stop.wait(min(delay, .25))
+        raise OSError("connection closed")
 
     def _server_now(self):
         try:
-            with self._open(urllib.request.Request(
+            with self._read_open(urllib.request.Request(
                     self.base + "/v1/health"), 8) as r:
                 return email.utils.parsedate_to_datetime(
                     r.headers.get("Date")).timestamp()
@@ -1915,11 +2208,11 @@ class RelayNet:
         # would be missed (the wrong "online" count on first join).
         start = str(int(self._server_now() - 3))
         failed = False
-        while True:
+        while not self.stop.is_set():
             try:
                 url = (f"{self.base}/{self.topic}/json?since="
                        f"{self.last_id or start}")
-                with self._open(urllib.request.Request(url), 90) as resp:
+                with self._read_open(urllib.request.Request(url), 90) as resp:
                     if not self.connected:
                         self.connected = True
                         self._status("online" if not failed
@@ -1934,7 +2227,7 @@ class RelayNet:
                 if not failed:
                     self._status("can't reach the chat server, retrying...")
                 failed = True
-            time.sleep(backoff)
+            self.stop.wait(backoff)
             backoff = min(backoff * 2, 15)
 
     def _handle(self, raw):
@@ -1950,8 +2243,14 @@ class RelayNet:
             return
         if msg.get("app") != "studychat" or msg.get("room") != self.room:
             return
+        if msg.get("type") == "delivery":
+            return
         mid = msg.get("id")
-        if not mid or mid in self.seen:           # our own echo or a repeat
+        if isinstance(mid, str) and msg.get("uid") == self.uid:
+            self.outbox.published(mid, ev.get("id"))
+            if msg.get("type") == "join":
+                self.join_ok = True
+        if not isinstance(mid, str) or not mid or mid in self.seen:           # our own echo or a repeat
             return
         self.seen.add(mid)
         msg.pop("data", None)
@@ -1976,7 +2275,7 @@ class RelayNet:
         try:
             if not str(url).startswith(self.base + "/"):   # only our relay
                 raise ValueError("unexpected url")
-            with self._open(urllib.request.Request(url), 30) as resp:
+            with self._read_open(urllib.request.Request(url), 30) as resp:
                 data = resp.read(MAX_IMAGE_BYTES + 1)
             if not data or len(data) > MAX_IMAGE_BYTES:
                 raise ValueError("bad size")
@@ -3871,6 +4170,10 @@ class Overlay:
         if text == "/duel":
             self.duel_cmd()
             return
+        if text == "/retry":
+            count = self.net.outbox.retry_failed() if self.net.mode == "online" else 0
+            self.note(f"Retrying {count} failed send(s).")
+            return
         if text == "/reels" or text.startswith("/reels "):
             self.open_reels(text[6:])
             return
@@ -4106,6 +4409,8 @@ class Overlay:
         self.net.send("", kind="ping",
                       extra={"game": {"op": "end", "gid": G["gid"]}})
         G["over"] = True
+        if self.net.mode == "online":
+            self.net.cancel_game(G["gid"])
         self.note("you ended the number guesser")
 
     def _game_host_window(self):
@@ -4222,6 +4527,8 @@ class Overlay:
             if n is None:
                 return
             first = uid not in G["guessed"]
+            if not first and self.net.mode == "online":
+                return                       # the cached result is already in the stream
             if first:
                 G["guessed"][uid] = (n, n == G["secret"])
             n, ok = G["guessed"][uid]    # asked twice? same answer again
@@ -4246,9 +4553,13 @@ class Overlay:
             self._game_announce(gname, n, ok, secret)
             if ok:
                 G["over"] = True
+                if self.net.mode == "online":
+                    self.net.cancel_game(G["gid"], keep_terminal=False)
             self._game_result_ui(mine, ok, gname, n, secret)
         elif op == "end" and not G["mine"] and uid == G["host_uid"]:
             G["over"] = True
+            if self.net.mode == "online":
+                self.net.cancel_game(G["gid"], keep_terminal=False)
             self._game_close_window()
             self.note(f"{G['host']} ended the number guesser")
 
@@ -4319,11 +4630,16 @@ class Overlay:
 
     def _game_send_guess(self, n):
         G = self.game
-        self.net.send("", kind="ping", extra={
+        msg = self.net.send("", kind="ping", extra={
             "game": {"op": "guess", "gid": G["gid"], "n": n}})
+        if self.net.mode == "online":
+            G["guess_id"], G["guess_delivery"] = msg["id"], "queued"
 
     def _game_skip(self):
         """"No thanks": close the popup. Skipping is never punished."""
+        if self.net.mode == "online" and self.game:
+            self.net.cancel_game(self.game["gid"])
+            self.game["over"] = True
         self._game_close_window()
 
     def _game_result_ui(self, mine, ok, gname, n, secret):
@@ -4372,6 +4688,8 @@ class Overlay:
         G = self.game
         if G and not G["mine"] and not G["over"] and uid == G["host_uid"]:
             G["over"] = True
+            if self.net.mode == "online":
+                self.net.cancel_game(G["gid"])
             self._game_close_window()
             self.note(f"{G['host']} left, so the number guesser ended")
 
@@ -4384,13 +4702,17 @@ class Overlay:
                 self.net.send("", kind="ping",
                               extra={"game": {"op": "end", "gid": G["gid"]}})
             G["over"] = True
+            if self.net.mode == "online":
+                self.net.cancel_game(G["gid"])
             self._game_close_window()
             self.note("the number guesser timed out")
             return
         if G["mine"] or G["my_guess"] is None:
             return
+        if self.net.mode == "online" and G.get("guess_delivery") != "published":
+            return
         waited = now - G["asked_at"]
-        if waited > 20 and not G["resent"]:          # the guess may be lost
+        if waited > 20 and not G["resent"] and self.net.mode != "online":
             G["resent"] = True
             self._game_send_guess(G["my_guess"])
         elif waited > 50 and G.get("ui") and not G.get("gave_up"):
@@ -4418,7 +4740,8 @@ class Overlay:
                 "reveals": {}, "pick": None, "nonce": "", "anim": False,
                 "win": None, "ui": None, "resend_at": 0, "peer_seen": False,
                 "accept_at": 0, "accept_n": 0, "forfeit_at": 0,
-                "last": "", "pop": None, "out": {}, "peer_done": 0}
+                "last": "", "pop": None, "out": {}, "peer_done": 0,
+                "v2": self.net.mode == "online", "delivery": {}}
 
     def duel_cmd(self):
         """/duel or the menu: challenge the room (or cancel your challenge)."""
@@ -4436,7 +4759,9 @@ class Overlay:
         self.duel = self._duel_blank(gid, self.net.uid, self.net.name, True)
         self._duel_send({"op": "challenge"})
         self.note("you challenged the room to a duel. Waiting for someone "
-                  "to accept (type /duel again to cancel)")
+                  "to accept (type /duel again to cancel)" +
+                  (". Online Duel requires the updated app on both computers."
+                   if self.duel["v2"] else ""))
 
     def duel_quit_cmd(self):
         D = self.duel
@@ -4451,9 +4776,16 @@ class Overlay:
         D = self.duel
         d = dict(d)
         d["gid"] = D["gid"]
-        if D.get("S"):
+        if D.get("S") and not D["v2"]:
             d["a"] = D["S"]["round"]         # rounds I have finished
-        self.net.send("", kind="ping", extra={"duel": d})
+        if D["v2"]:
+            d["v"] = 2
+        msg = self.net.send("", kind="ping", extra={
+            "duel2" if D["v2"] else "duel": d})
+        if D["v2"]:
+            D["delivery"][(d.get("r"), d["op"])] = {
+                "id": msg["id"], "state": "queued"}
+        return msg
 
     def _duel_out(self, d):
         """Send a pick, and keep it to resend until they've played past it."""
@@ -4466,6 +4798,8 @@ class Overlay:
         if not D:
             return
         D["over"] = True
+        if D["v2"]:
+            self.net.cancel_game(D["gid"])
         self._duel_close_popup()
         if note:
             self.note(note)
@@ -4487,7 +4821,15 @@ class Overlay:
     def _duel_msg(self, msg):
         """Everything the duel receives. Fields come from other computers,
         so every one is checked."""
-        d, uid = msg["duel"], msg.get("uid")
+        online = self.net.mode == "online"
+        if online and "duel2" not in msg:
+            if msg.get("duel", {}).get("op") == "challenge":
+                self.note("Online Duel needs the updated app on both computers. "
+                          "Ask the challenger to update.")
+            return
+        d, uid = msg.get("duel2" if online else "duel", {}), msg.get("uid")
+        if not isinstance(d, dict) or (online and d.get("v") != 2):
+            return
         if not isinstance(uid, str) or not uid:
             return
         op, gid = d.get("op"), d.get("gid")
@@ -4536,17 +4878,32 @@ class Overlay:
                 return
             if op == "quit":
                 self._duel_finish(1 - idx, "forfeit")
-            elif r is None or r > D["r"] + 1 or r < D["r"] - 1:
+            elif op == "cancel" and D["v2"]:
+                self._duel_abort("The interrupted duel was cancelled. No result.")
+            elif (r is None or r > (DUEL_MAX_ROUNDS if D["v2"] else D["r"] + 1)
+                  or r < D["r"] - 1):
                 return
-            elif op == "commit":
+            elif op in ("commit", "commit_reveal"):
+                if op == "commit_reveal" and not D["v2"]:
+                    return
+                if D["v2"] and idx != ((r - 1) % 2 if op == "commit" else r % 2):
+                    return
                 h = d.get("h")
+                m, nonce = d.get("m"), d.get("nonce")
+                if op == "commit_reveal" and not (
+                        isinstance(m, str) and m in DUEL_MOVES
+                        and isinstance(nonce, str) and len(nonce) <= 32
+                        and duel_commit(gid, r, uid, m, nonce) == h):
+                    return
                 if (isinstance(h, str) and re.fullmatch(r"[0-9a-f]{64}", h)
                         and (r, idx) not in D["commits"]):
                     D["commits"][(r, idx)] = h
+                    if op == "commit_reveal":
+                        D["reveals"][(r, idx)] = (m, nonce)
                     self._duel_progress()
             elif op == "reveal":
                 m, nonce = d.get("m"), str(d.get("nonce", ""))[:32]
-                if m in DUEL_MOVES and (r, idx) not in D["reveals"]:
+                if isinstance(m, str) and m in DUEL_MOVES and (r, idx) not in D["reveals"]:
                     D["reveals"][(r, idx)] = (m, nonce)
                     self._duel_progress()
 
@@ -4580,6 +4937,9 @@ class Overlay:
 
     def _duel_accept(self):
         D = self.duel
+        if D and not D["over"] and D["v2"] and D["state"] == "accepting":
+            self._duel_retry()
+            return
         if not D or D["over"] or D["state"] != "invited":
             return
         D["state"] = "accepting"
@@ -4595,6 +4955,8 @@ class Overlay:
         D = self.duel
         if D and not D["over"] and D["state"] in ("invited", "accepting"):
             D["over"] = True                         # ignoring is never punished
+            if D["v2"]:
+                self.net.cancel_game(D["gid"])
         self._duel_close_popup()
 
     def _duel_start(self, uids, names):
@@ -4636,6 +4998,11 @@ class Overlay:
             b.bind("<Leave>", lambda e: self._duel_hint(None))
             btns[m] = b
             win.bind(str(n), lambda e, m=m: self._duel_pick(m))
+        if D["v2"]:
+            retry = tk.Button(win, text="Retry send", state="disabled",
+                              command=self._duel_retry)
+            retry.pack(pady=(0, 6))
+            D["retry_button"] = retry
         helpl = tk.Label(win, text="", bg=BG, fg=MUTED, font=F(-1))
         helpl.pack(pady=(0, 10))
         win.protocol("WM_DELETE_WINDOW", self._duel_close_window)
@@ -4710,15 +5077,30 @@ class Overlay:
         D = self.duel
         from tkinter import messagebox
         self.busy = True
+        interrupted = D["v2"] and (not self.net.connected or any(
+            d["state"] in ("failed", "delayed") for d in D["delivery"].values()))
+        if D.get("quitting") and not interrupted:
+            return
         try:
             ok = messagebox.askyesno(
-                "Duel", "Forfeit the duel? Your opponent wins.",
+                "Duel", ("Cancel the interrupted duel? No result will be announced."
+                         if interrupted else "Forfeit the duel? Your opponent wins."),
                 parent=D.get("win") or self.root)
         except Exception:
             ok = False
         if ok and not D["over"]:
+            if interrupted:
+                self._duel_abort("Interrupted duel cancelled. No result.")
+                self._duel_send({"op": "cancel"})
+                return
             self._duel_out({"op": "quit", "r": 100000})   # resent for a while
-            self._duel_finish(1 - D["me"], "forfeit")
+            if D["v2"]:
+                self.net.cancel_game(D["gid"])
+                D["quitting"] = True
+                self._duel_buttons(False)
+                D["ui"]["status"].config(text="Waiting to send forfeit...")
+            else:
+                self._duel_finish(1 - D["me"], "forfeit")
         self.busy = self.settings_win is not None or bool(D.get("win"))
 
     def _duel_draw(self, fr):
@@ -4777,6 +5159,7 @@ class Overlay:
         need = duel_need(S)
         ui = D.get("ui")
         if not ui:
+            self._duel_progress()
             return
         mine = D["me"] in need
         self._duel_buttons(mine)
@@ -4797,7 +5180,7 @@ class Overlay:
     def _duel_pick(self, move):
         D = self.duel
         if (not D or D["state"] != "playing" or D["over"] or D["anim"]
-                or D["pick"] is not None or move not in DUEL_MOVES):
+                or D.get("quitting") or D["pick"] is not None or move not in DUEL_MOVES):
             return
         S, me, r = D["S"], D["me"], D["r"]
         need = duel_need(S)
@@ -4809,7 +5192,8 @@ class Overlay:
             D["nonce"] = uuid.uuid4().hex[:16]
             h = duel_commit(D["gid"], r, self.net.uid, move, D["nonce"])
             D["commits"][(r, me)] = h
-            self._duel_out({"op": "commit", "r": r, "h": h})
+            if not D["v2"]:
+                self._duel_out({"op": "commit", "r": r, "h": h})
         else:
             D["reveals"][(r, me)] = (move, "")
             self._duel_out({"op": "reveal", "r": r, "m": move})
@@ -4825,6 +5209,8 @@ class Overlay:
         may be several rounds ahead. So keep saying every pick the other
         side hasn't played past yet (harmless to repeat), plus an ack."""
         D = self.duel
+        if D["v2"]:
+            return
         for key in sorted(D["out"]):
             if key[0] <= D["peer_done"]:
                 D["out"].pop(key, None)
@@ -4832,14 +5218,56 @@ class Overlay:
                 self._duel_send(D["out"][key])
         self._duel_send({"op": "ack"})
 
+    def _duel_published(self, r, op):
+        return self.duel["delivery"].get((r, op), {}).get("state") == "published"
+
+    def _duel_v2_prepare(self, need):
+        """Alternate commitment roles; a queued move cannot advance combat."""
+        D = self.duel
+        r, me = D["r"], D["me"]
+        if me not in need:
+            return True
+        if D["pick"] is None:
+            return False
+        if len(need) == 1:
+            return self._duel_published(r, "reveal")
+        first = (r - 1) % 2
+        if me == first:
+            if (r, "commit") not in D["out"]:
+                self._duel_out({"op": "commit", "r": r,
+                                "h": D["commits"][(r, me)]})
+            if (not self._duel_published(r, "commit")
+                    or (r, 1 - me) not in D["reveals"]
+                    or (r, 1 - me) not in D["commits"]):
+                return False
+            move, nonce = D["reveals"][(r, 1 - me)]
+            if duel_commit(D["gid"], r, D["uids"][1 - me], move, nonce) != D["commits"][(r, 1 - me)]:
+                self._duel_abort("Invalid opponent commitment. No result.")
+                return False
+            op = "reveal"
+        else:
+            if (r, first) not in D["commits"]:
+                return False
+            op = "commit_reveal"
+        if (r, op) not in D["out"]:
+            D["reveals"][(r, me)] = (D["pick"], D["nonce"])
+            packet = {"op": op, "r": r, "m": D["pick"], "nonce": D["nonce"]}
+            if op == "commit_reveal":
+                packet["h"] = D["commits"][(r, me)]
+            self._duel_out(packet)
+        return self._duel_published(r, op)
+
     def _duel_progress(self):
         """Reveal when both have committed; play when all picks are known."""
         D = self.duel
-        if not D or D["state"] != "playing" or D["over"] or D["anim"]:
+        if (not D or D["state"] != "playing" or D["over"] or D["anim"]
+                or D.get("quitting")):
             return
         S, me, r = D["S"], D["me"], D["r"]
         need = duel_need(S)
-        if (len(need) == 2 and D["pick"] is not None
+        if D["v2"] and not self._duel_v2_prepare(need):
+            return
+        if (not D["v2"] and len(need) == 2 and D["pick"] is not None
                 and (r, me) not in D["reveals"]
                 and all((r, i) in D["commits"] for i in need)):
             D["reveals"][(r, me)] = (D["pick"], D["nonce"])
@@ -4888,9 +5316,10 @@ class Overlay:
         return "   ".join(parts) + ("  -  " + ", ".join(out) if out else
                                     "  -  nothing connected")
 
-    def _duel_animate(self, frames, i):
+    def _duel_animate(self, frames, i, gid=None):
         D = self.duel
-        if not D or D["over"] and not D.get("ui"):
+        if (not D or (gid is not None and D["gid"] != gid) or D["over"]
+                or D.get("quitting")):
             return
         if i < len(frames) and D.get("ui"):
             fx = D["fx"]
@@ -4902,7 +5331,7 @@ class Overlay:
             if fx.hold:                              # hit-stop: freeze a beat
                 fx.hold -= 1
                 delay = 120
-            self.root.after(delay, lambda: self._duel_animate(frames, i + 1))
+            self.root.after(delay, lambda: self._duel_animate(frames, i + 1, D["gid"]))
             return
         S = D["S"]
         if S["over"]:
@@ -4916,6 +5345,8 @@ class Overlay:
         if not D or D["over"]:
             return
         D["over"] = True
+        if D["v2"]:
+            self.net.cancel_game(D["gid"])
         D["anim"] = False                    # let the idle loop paint the end
         D["over_at"] = time.time()           # keep resending a little longer
         if winner in (0, 1):
@@ -4956,6 +5387,10 @@ class Overlay:
 
     def _duel_tick(self, now):
         D = self.duel
+        if D and D["v2"]:
+            if not D["over"] and now - D["t0"] > self.DUEL_SECONDS:
+                self._duel_abort("Duel timed out before completion. No result.")
+            return                       # cached relay delivery replaces all game retries
         if D and D["over"] and D["state"] == "playing" and D["S"] \
                 and now - D.get("over_at", 0) < 40 and now > D["resend_at"]:
             D["resend_at"] = now + 3         # so the other side can finish
@@ -4982,6 +5417,86 @@ class Overlay:
             if D["mine"] and not D["peer_seen"] and D["r"] == 1:
                 self._duel_send({"op": "go", "p1": D["uids"][1],
                                  "n1": D["names"][1], "n0": D["names"][0]})
+
+    def _duel_abort(self, text):
+        D = self.duel
+        if not D or D["over"]:
+            return
+        D["over"], D["anim"] = True, False
+        self.net.cancel_game(D["gid"], keep_terminal=False)
+        self._duel_close_popup()
+        self._duel_buttons(False)
+        if D.get("ui"):
+            D["ui"]["status"].config(text=text, fg=MUTED)
+        self.note(text)
+
+    def _duel_retry(self):
+        D = self.duel
+        if D and D["v2"] and not D["over"]:
+            for delivery in D["delivery"].values():
+                if delivery["state"] == "failed":
+                    self.net.retry(delivery["id"])
+
+    def _delivery_msg(self, msg):
+        """Only called on the Tk thread; transport threads never touch widgets."""
+        state, mid, gid = msg["state"], msg["id"], msg.get("gid")
+        D = self.duel
+        if D and D["v2"] and D["gid"] == gid:
+            key = next((k for k, d in D["delivery"].items() if d["id"] == mid), None)
+            if key is None:
+                return
+            D["delivery"][key]["state"] = state
+            if D["over"]:
+                return
+            if state == "published":
+                if key[1] == "quit" and D.get("quitting"):
+                    self._duel_finish(1 - D["me"], "forfeit")
+                    return
+                self._duel_progress()
+            if D["over"] or D["anim"] or state == "cancelled":
+                return
+            text = (msg.get("text") or
+                    ("Waiting for opponent..." if state == "published" else
+                     "Waiting to send..."))
+            if state == "failed":
+                text += " Retry send, or cancel the interrupted duel."
+            if D.get("ui"):
+                if state != "published" or D["pick"] is not None:
+                    D["ui"]["status"].config(text=text, fg=MUTED)
+                if D.get("retry_button"):
+                    D["retry_button"].config(state="normal" if any(
+                        d["state"] == "failed" for d in D["delivery"].values()) else "disabled")
+            elif D.get("pop") and D["state"] == "accepting":
+                D["pop_status"].config(text=text)
+                D["pop_acc"].config(text="Retry send", state=
+                                    "normal" if state == "failed" else "disabled")
+            elif state in ("failed", "delayed"):
+                self.note(text + " Type /retry to retry failed sends, or /duel to cancel.")
+            return
+        G = self.game
+        if G and G["gid"] == gid:
+            if G.get("guess_id") == mid:
+                G["guess_delivery"] = state
+                if state == "published":
+                    G["asked_at"] = time.time()
+                ui = G.get("ui")
+                if ui and not G["over"]:
+                    ui["status"].config(text=(msg.get("text") or
+                        (f"Waiting for {G['host']}..." if state == "published"
+                         else "Waiting to send...")))
+                    if state == "failed":
+                        ui["guess"].config(text="Retry send", state="normal",
+                                           command=lambda: self.net.retry(mid))
+                        ui["skip"].config(state="normal")
+                    else:
+                        ui["guess"].config(state="disabled")
+            elif state == "failed":
+                self.note(msg.get("text", "Game message could not be sent.") +
+                          " Type /retry to retry.")
+            return
+        if state == "failed" and not gid:
+            self.note(msg.get("text", "Message could not be sent.") +
+                      " Type /retry to retry.")
 
     def _font_set(self):
         """Fonts installed on this computer (lower case)."""
@@ -5140,6 +5655,9 @@ class Overlay:
             self.note("couldn't restart by itself; please close and reopen")
 
     def _handle_incoming(self, msg):
+        if msg.get("type") == "delivery":
+            self._delivery_msg(msg)
+            return
         if msg.get("type") == "summon":
             self.set_state("active")
             self.reset_window_position()
@@ -5207,7 +5725,7 @@ class Overlay:
             if isinstance(msg.get("game"), dict):
                 self._game_msg(msg)
                 return
-            if isinstance(msg.get("duel"), dict):
+            if isinstance(msg.get("duel"), dict) or isinstance(msg.get("duel2"), dict):
                 self._duel_msg(msg)
                 return
             if isinstance(msg.get("fontlist"), list):
@@ -5327,7 +5845,14 @@ class Overlay:
                 except Exception:
                     log("background job failed: " + traceback.format_exc())
             # tell others we're still here, and notice when someone stops
-            if now - self.last_ping > self.net.ping_every:
+            last_published = self.last_ping
+            if online:
+                members = len(self.presence.peers) + 1
+                if self.duel and not self.duel["over"]:
+                    members = max(2, members)
+                self.net.outbox.set_members(members)
+                last_published = max(last_published, self.net.outbox.last_published)
+            if now - last_published > self.net.ping_every:
                 self.last_ping = now
                 self.net.send("", kind="ping")
             for pname in self.presence.expired(now, 3 * self.net.ping_every):

@@ -91,6 +91,7 @@ class OverlayTests(unittest.TestCase):
         # Exercise the actual placement/state methods without Tk or networking.
         ov = object.__new__(chat.Overlay)
         ov.root = Mock()
+        ov.root.winfo_children.return_value = []
         ov._dragging = False
         ov._placed_geometry = None
         ov._focus_job = None
@@ -99,8 +100,9 @@ class OverlayTests(unittest.TestCase):
         ov.state = "collapsed"
         ov.seq = 0
         ov.busy = False
+        ov.menu_until = 0
         for name in ("pill", "header", "text", "entry_wrap", "entry", "title",
-                     "close_lbl", "menu_lbl", "fonts_lbl", "online_lbl", "plus"):
+                     "close_lbl", "menu_lbl", "fonts_lbl", "online_lbl", "plus", "skull"):
             setattr(ov, name, Mock())
         ov._pack_active = Mock()
         ov._focus_entry = Mock()
