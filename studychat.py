@@ -13,8 +13,20 @@ How it behaves:
   - Idle: a small blue "Chat" button sits in the bottom-left corner.
   - New message: a small popup opens in the corner, then shrinks back.
   - Click the button/popup to type. Enter sends. Esc closes it.
-  - Drag the top bar to move it (it remembers where you put it).
+  - Every launch starts at the bottom-left of the primary display.
+  - Drag the top bar to move it for this session, including between monitors.
+    On Windows, dropping it keeps it inside a display's usable area.
   - Right-click the button to open Settings or quit.
+
+Lost window:
+  - Restart Study Chat to bring it back to the bottom-left corner.
+  - The menu's "Reset window position" brings it back without restarting.
+  - Ctrl+Alt+C brings it back and opens the chat if the optional pynput
+    package is installed (pip install pynput). Off by default on macOS.
+  - On Windows, disconnecting the display holding the chat brings it back
+    to the primary display within a couple of seconds.
+  - For older versions: close the chat, open %USERPROFILE%\\.studychat.json
+    in Notepad, set ANCHOR_X to 20 and BOTTOM_MARGIN to 70, save and restart.
 
 Flip:
   - The "flip" button (or /flip) turns everyone's chat text upside down for
@@ -87,6 +99,7 @@ import traceback
 import urllib.error
 import urllib.request
 import uuid
+from dataclasses import dataclass
 
 try:
     from PIL import Image, ImageGrab
@@ -135,8 +148,8 @@ WIDTH = 360
 POPUP_HEIGHT = 130
 POPUP_IMG_HEIGHT = 270   # popup is taller when the newest message is an image
 ACTIVE_HEIGHT = 330
-ANCHOR_X = 20            # distance from the left edge of the screen
-BOTTOM_MARGIN = 70       # distance from the bottom edge of the screen
+ANCHOR_X = 20            # fixed startup offset from the usable left edge
+BOTTOM_MARGIN = 70       # fixed startup offset from the usable bottom edge
 
 # --- Behavior
 POPUP_SECONDS = 8        # how long a new-message popup stays open
@@ -186,8 +199,6 @@ SPEC = [
     ("Window", "POPUP_HEIGHT", "Popup height (text)", "int", 60, 600),
     ("Window", "POPUP_IMG_HEIGHT", "Popup height (image)", "int", 100, 900),
     ("Window", "ACTIVE_HEIGHT", "Chat window height", "int", 120, 1000),
-    ("Window", "ANCHOR_X", "Distance from left edge", "int", 0, 5000),
-    ("Window", "BOTTOM_MARGIN", "Distance from bottom edge", "int", 0, 3000),
     ("Behavior", "POPUP_SECONDS", "Popup stays open (seconds)", "int", 1, 120),
     ("Behavior", "ACTIVE_IDLE_SECONDS", "Close typing box after idle (seconds)",
      "int", 3, 600),
@@ -274,6 +285,94 @@ def save_settings():
         return True
     except OSError:
         return False
+
+
+# ---------------------------------------------------------- window placement
+@dataclass(frozen=True)
+class Monitor:
+    name: str
+    bounds: tuple                       # left, top, right, bottom
+    work: tuple                         # usable rectangle, excluding taskbars
+    primary: bool = False
+
+
+def _windows_monitors():
+    """Read monitor rectangles in the UI thread's existing DPI context."""
+    import ctypes
+    from ctypes import wintypes
+
+    class MonitorInfo(ctypes.Structure):
+        _fields_ = [("cbSize", wintypes.DWORD),
+                    ("rcMonitor", wintypes.RECT),
+                    ("rcWork", wintypes.RECT),
+                    ("dwFlags", wintypes.DWORD),
+                    ("szDevice", wintypes.WCHAR * 32)]
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    callback_type = ctypes.WINFUNCTYPE(
+        wintypes.BOOL, wintypes.HANDLE, wintypes.HDC,
+        ctypes.POINTER(wintypes.RECT), wintypes.LPARAM)
+    user32.EnumDisplayMonitors.argtypes = (
+        wintypes.HDC, ctypes.POINTER(wintypes.RECT),
+        callback_type, wintypes.LPARAM)
+    user32.EnumDisplayMonitors.restype = wintypes.BOOL
+    user32.GetMonitorInfoW.argtypes = (
+        wintypes.HANDLE, ctypes.POINTER(MonitorInfo))
+    user32.GetMonitorInfoW.restype = wintypes.BOOL
+    monitors = []
+
+    @callback_type
+    def collect(handle, _hdc, _rect, _data):
+        info = MonitorInfo()
+        info.cbSize = ctypes.sizeof(info)
+        if user32.GetMonitorInfoW(handle, ctypes.byref(info)):
+            r, w = info.rcMonitor, info.rcWork
+            if r.right > r.left and r.bottom > r.top and (
+                    w.right > w.left and w.bottom > w.top):
+                monitors.append(Monitor(
+                    info.szDevice, (r.left, r.top, r.right, r.bottom),
+                    (w.left, w.top, w.right, w.bottom),
+                    bool(info.dwFlags & 1)))  # MONITORINFOF_PRIMARY
+        return True
+
+    if not user32.EnumDisplayMonitors(None, None, collect, 0):
+        raise ctypes.WinError(ctypes.get_last_error())
+    if not monitors or not any(m.primary for m in monitors):
+        raise OSError("could not read the primary display")
+    return sorted(monitors, key=lambda m: (not m.primary, m.name))
+
+
+def display_monitors(root):
+    """Windows work areas, or a safe Tk screen fallback without dependencies."""
+    if sys.platform == "win32":
+        try:
+            return _windows_monitors()
+        except (OSError, AttributeError):
+            pass
+    bounds = (0, 0, max(1, root.winfo_screenwidth()),
+              max(1, root.winfo_screenheight()))
+    return [Monitor("tk-screen", bounds, bounds, True)]
+
+
+def monitor_for_window(x, y, w, h, monitors):
+    """Prefer greatest overlap, then shortest distance, then the primary."""
+    def rank(m):
+        left, top, right, bottom = m.bounds
+        overlap = (max(0, min(x + w, right) - max(x, left))
+                   * max(0, min(y + h, bottom) - max(y, top)))
+        dx = max(left - (x + w), x - right, 0)
+        dy = max(top - (y + h), y - bottom, 0)
+        return (-overlap, dx * dx + dy * dy, not m.primary, m.name)
+    return min(monitors, key=rank)
+
+
+def fit_window(x, anchor_bottom, w, h, work):
+    """Fit a bottom-anchored window without changing its configured size."""
+    left, top, right, bottom = work
+    w, h = min(w, right - left), min(h, bottom - top)
+    x = max(left, min(x, right - w))
+    y = max(top, min(anchor_bottom - h, bottom - h))
+    return int(x), int(y), int(w), int(h)
 
 
 def F(delta=0, bold=False):
@@ -1349,8 +1448,9 @@ class Overlay:
         root.configure(bg=BG)
 
         # anchor = bottom-left corner, so growing/shrinking keeps it in place
-        self.anchor_x = ANCHOR_X
-        self.anchor_bottom = root.winfo_screenheight() - BOTTOM_MARGIN
+        self._dragging = False
+        self._placed_geometry = None
+        self._reset_anchor()
 
         # pieces
         self.pill = tk.Label(root, text=PILL_LABEL, bg=PILL_BG, fg=PILL_FG,
@@ -1425,14 +1525,58 @@ class Overlay:
         for w in (self.title, self.close_lbl, self.menu_lbl, self.plus):
             self.label_text[w] = w.cget("text")
         self.set_state("collapsed")
+        self._geometry(fit=True)            # also fit startup on non-Windows
         self.root.after(100, self.poll)
         self.root.after(500, self.tick)
         self.root.after(60, self._animate)
 
     # ---- geometry / state
-    def _place(self, w, h):
+    def _reset_anchor(self, monitors=None):
+        self._monitors = (display_monitors(self.root) if monitors is None
+                          else monitors)
+        primary = next(m for m in self._monitors if m.primary)
+        self._monitor_name = primary.name
+        self.anchor_x = primary.work[0] + ANCHOR_X
+        self.anchor_bottom = primary.work[3] - BOTTOM_MARGIN
+
+    def reset_window_position(self):
+        """Return to the startup corner without losing the current chat."""
+        self._dragging = False
+        self._reset_anchor()
+        self._placed_geometry = None
+        self._geometry(fit=True)
+        self.root.lift()
+        self._focus_entry()
+
+    def _check_displays(self):
+        if sys.platform != "win32" or self._dragging:
+            return
+        monitors = display_monitors(self.root)
+        if monitors == self._monitors:
+            return
+        if not any(m.name == self._monitor_name for m in monitors):
+            self._reset_anchor(monitors)
+        else:
+            self._monitors = monitors
+        self._placed_geometry = None
+        self._geometry()
+
+    def _place(self, w, h, fit=False):
         x, y = self.anchor_x, self.anchor_bottom - h
-        self.root.geometry(f"{w}x{h}+{x}+{y}")
+        if not self._dragging and (sys.platform == "win32" or fit):
+            # Expanding near an edge must stay on the display chosen at the
+            # last drop (or reset), even if the larger rectangle crosses it.
+            monitor = next(m for m in self._monitors
+                           if m.name == self._monitor_name)
+            x, y, w, h = fit_window(x, self.anchor_bottom, w, h, monitor.work)
+            self.anchor_x, self.anchor_bottom = x, y + h
+            self._monitor_name = monitor.name
+        geometry = (x, y, w, h)
+        if geometry != self._placed_geometry:
+            # Keep the explicit '+' even for negative coordinates: '+-100'
+            # is absolute; '-100' means 100px from Tk's right/bottom edge.
+            self.root.geometry(f"{w}x{h}+{x}+{y}")
+            self._placed_geometry = geometry
 
     def _popup_msgs(self):
         """What the popup shows: the newest message plus the ones before it
@@ -1441,21 +1585,23 @@ class Overlay:
         fresh = [m for m in self.history if m.get("_n", 0) > self.seen_upto]
         return fresh[-max(1, min(5, POPUP_LINES)):] or self.history[-1:]
 
-    def _geometry(self):
+    def _geometry(self, fit=False):
         """Size, position and opacity for the current state."""
         if self.state == "collapsed":
-            self._place(PILL_W, PILL_H)
+            self._place(PILL_W, PILL_H, fit=fit)
             alpha = PILL_ALPHA
         elif self.state == "popup":
             has_img = any(m.get("type") == "img" for m in self._popup_msgs())
-            self._place(WIDTH, POPUP_IMG_HEIGHT if has_img else POPUP_HEIGHT)
+            self._place(WIDTH, POPUP_IMG_HEIGHT if has_img else POPUP_HEIGHT,
+                        fit=fit)
             alpha = POPUP_ALPHA
         else:
-            self._place(WIDTH, ACTIVE_HEIGHT)
+            self._place(WIDTH, ACTIVE_HEIGHT, fit=fit)
             alpha = ACTIVE_ALPHA
         self.root.attributes("-alpha", alpha)
 
     def set_state(self, state):
+        self._dragging = False
         if self._focus_job is not None:
             self.root.after_cancel(self._focus_job)
             self._focus_job = None
@@ -1562,8 +1708,6 @@ class Overlay:
         for m in self.history:               # thumbnails may change size
             m.pop("_photo", None)
             m.pop("_anim", None)
-        self.anchor_x = ANCHOR_X
-        self.anchor_bottom = self.root.winfo_screenheight() - BOTTOM_MARGIN
         self._geometry()
         self.redraw()
 
@@ -2111,6 +2255,8 @@ class Overlay:
         else:
             m.add_command(label="Check for updates", command=self.update_cmd)
         m.add_command(label="Settings...", command=self.open_settings)
+        m.add_command(label="Reset window position",
+                      command=self.reset_window_position)
         m.add_separator()
         m.add_command(label="Disconnect and quit", command=self.disconnect)
 
@@ -2221,22 +2367,28 @@ class Overlay:
         self.last_activity = time.time()
 
     def _drag_start(self, e):
+        self._dragging = True
+        self._drag_size = self._placed_geometry[2:]
         self._dx, self._dy = e.x_root, e.y_root
+        self._touch()
 
     def _drag_move(self, e):
+        if not self._dragging:
+            return
         self.anchor_x += e.x_root - self._dx
         self.anchor_bottom += e.y_root - self._dy
         self._dx, self._dy = e.x_root, e.y_root
-        self._place(WIDTH, ACTIVE_HEIGHT)
+        self._place(*self._drag_size)
+        self._touch()
 
     def _drag_end(self, _e):
-        """Remember where the window was dropped."""
-        global ANCHOR_X, BOTTOM_MARGIN
-        ANCHOR_X = max(0, int(self.anchor_x))
-        BOTTOM_MARGIN = max(0, int(self.root.winfo_screenheight()
-                                   - self.anchor_bottom))
-        if self.settings_win is None:
-            save_settings()
+        """Keep the drop reachable for this session; never persist it."""
+        self._dragging = False
+        self._monitors = display_monitors(self.root)
+        self._monitor_name = monitor_for_window(
+            *self._placed_geometry, self._monitors).name
+        self._geometry()
+        self._touch()
 
     # ---- images
     def _pil_photo(self, im):
@@ -2842,6 +2994,7 @@ class Overlay:
     def _handle_incoming(self, msg):
         if msg.get("type") == "summon":
             self.set_state("active")
+            self.reset_window_position()
             return
         if msg.get("type") == "update_found":
             info = msg.get("info") or {}
@@ -2988,7 +3141,7 @@ class Overlay:
                 self._deliver({"type": "leave", "name": pname, "text": ""})
             if self.state == "popup" and now > self.popup_until:
                 self.set_state("collapsed")
-            elif (self.state == "active" and not self.busy
+            elif (self.state == "active" and not self.busy and not self._dragging
                   and not self.entry.get()
                   and now - self.last_activity > ACTIVE_IDLE_SECONDS):
                 self.set_state("collapsed")
@@ -2996,6 +3149,7 @@ class Overlay:
             self.tick_n += 1
             if self.tick_n % 4 == 0:
                 self.root.attributes("-topmost", True)
+                self._check_displays()
         except Exception:
             log("tick failed: " + traceback.format_exc())
         finally:
