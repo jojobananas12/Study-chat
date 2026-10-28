@@ -37,11 +37,11 @@ class Room:
             net.base, net.topic, net.token = "https://relay.invalid", "test", None
             net.seen, net.last_id = set(), None
             net.connected, net.join_ok, net.closed = True, True, False
+            net.ping_every = 240
             net.stop = threading.Event()
             net.inbox = queue.Queue()
             net.outbox = chat.RelayOutbox(net.inbox, clock=self.clock.mono,
                                          wall=self.clock.wall, jitter=lambda a, b: a)
-            net.outbox.set_members(count)
             net._open = lambda req, timeout, net=net: self.publish(net, req)
             ov = chat.Overlay.__new__(chat.Overlay)
             ov.net, ov.root, ov.game, ov.duel = net, Mock(), None, None
@@ -50,6 +50,14 @@ class Room:
                            "_duel_window", "_duel_close_popup"):
                 setattr(ov, method, Mock())
             self.clients.append(ov)
+        for ov in self.clients:
+            ov.presence = chat.Presence()
+            ov.presence.peers = {peer.net.uid: (peer.net.name, time.time())
+                                 for peer in self.clients if peer is not ov}
+            ov.last_tick = ov.last_ping = ov.start_time = ov.ready_at = time.time()
+            ov.roll_done, ov.tick_n, ov.state = True, 0, "collapsed"
+            ov._fonts_tick = Mock()
+            ov.tick()  # exercise the real room/presence integration
 
     def publish(self, net, req):
         msg = json.loads(req.data)
@@ -77,13 +85,13 @@ class Room:
 
     def flush(self):
         for _ in range(10000):
-            for ov in self.clients:
-                ov.net._send_once()
-            self.receive()
+            progressed = sum(ov.net._send_once() for ov in self.clients)
+            progressed += self.receive()
             if not any(j.state in ("queued", "sending", "delayed")
                        for ov in self.clients for j in ov.net.outbox.jobs.values()):
                 return
-            self.clock.advance()
+            if not progressed:
+                self.clock.advance()
         raise AssertionError("send queue did not settle")
 
     def start(self):
@@ -97,6 +105,28 @@ class Room:
 
 
 class DuelProtocolTests(unittest.TestCase):
+    def test_idle_spectators_do_not_delay_startup_or_ten_rounds(self):
+        timings = []
+        for count in (2, 4, 8):
+            with self.subTest(members=count):
+                room = Room(count)
+                for ov in room.clients:
+                    # Account for the normal health check and subscription.
+                    self.assertEqual(ov.net.outbox.reserve_read(), 0)
+                    self.assertEqual(ov.net.outbox.reserve_read(), 0)
+                started = room.clock.mono()
+                room.start()
+                for _ in range(10):
+                    for ov in room.clients:
+                        ov.tick()
+                    for ov in room.clients[:2]:
+                        ov._duel_pick("wait")
+                    room.flush()
+                timings.append(room.clock.mono() - started)
+                self.assertEqual(len(room.messages), 33)
+                self.assertEqual(room.clients[0].duel["S"], room.clients[1].duel["S"])
+        self.assertEqual(timings, [0, 0, 0])
+
     def test_full_fifty_round_match_has_154_publications(self):
         room = Room()
         room.start()
@@ -253,6 +283,76 @@ class DuelProtocolTests(unittest.TestCase):
         self.assertEqual(jobs[0].msg["duel"]["op"], "commit")
         a._duel_tick(a.duel["resend_at"] + 1)
         self.assertGreater(len(a.net.outbox.jobs), 1)
+
+
+class DuelStatusTests(unittest.TestCase):
+    def setUp(self):
+        self.room = Room()
+        self.ov = self.room.clients[0]
+        self.ov.duel = self.ov._duel_blank("0" * 12, "0", "Player 0", True)
+        self.ov._duel_start(["0", "1"], ["Player 0", "Player 1"])
+        self.ov.duel["ui"] = {"status": Mock(), "info": Mock(), "btns": {}}
+        self.ov.duel["retry_button"] = Mock()
+        self.go = self.ov._duel_send({"op": "go", "p1": "1"})
+
+    def deliver(self, msg, state, **extra):
+        self.ov._delivery_msg({"id": msg["id"], "gid": self.ov.duel["gid"],
+                               "state": state, "text": "", **extra})
+
+    def status(self):
+        return self.ov.duel["ui"]["status"].config.call_args.kwargs["text"]
+
+    def delayed(self, msg):
+        self.deliver(msg, "delayed", text="Queued to send.", reason="budget",
+                     retry_at=self.room.clock.mono() + 5)
+
+    def test_successful_startup_publication_restores_pick_instruction(self):
+        self.delayed(self.go)
+        self.assertIn("Queued to send", self.status())
+        self.assertIn("~5s", self.status())
+        self.deliver(self.go, "published")
+        self.assertEqual(self.status(), "Round 1: pick your move (1-7)")
+        self.delayed(self.go)  # stale callback cannot reopen a completed send
+        self.assertEqual(self.status(), "Round 1: pick your move (1-7)")
+
+    def test_countdown_changes_without_extra_delivery_events(self):
+        self.delayed(self.go)
+        self.room.clock.advance(2)
+        self.ov._duel_tick(time.time())
+        self.assertIn("~3s", self.status())
+
+    def test_old_round_delay_does_not_overwrite_current_instruction(self):
+        old = self.ov._duel_send({"op": "commit", "r": 1, "h": "0" * 64})
+        self.ov.duel["S"]["round"] = 1
+        self.ov._duel_begin_round()
+        self.delayed(old)
+        self.assertEqual(self.status(), "Round 2: pick your move (1-7)")
+        self.deliver(old, "failed", text="Old failure")
+        self.assertEqual(self.status(), "Round 2: pick your move (1-7)")
+        self.ov.duel["retry_button"].config.assert_called_with(state="disabled")
+
+    def test_old_success_does_not_clear_current_move_delay(self):
+        self.ov._duel_pick("wait")
+        move = {"id": self.ov.duel["delivery"][(1, "commit")]["id"]}
+        self.delayed(move)
+        self.deliver(self.go, "published")
+        self.assertIn("Queued to send", self.status())
+
+    def test_cancel_and_late_success_keep_no_result_status(self):
+        self.delayed(self.go)
+        self.ov._duel_abort("Interrupted duel cancelled. No result.")
+        self.deliver(self.go, "cancelled")
+        self.deliver(self.go, "published")
+        self.assertEqual(self.status(), "Interrupted duel cancelled. No result.")
+
+    def test_disconnection_is_distinct_from_local_budget_wait(self):
+        self.deliver(self.go, "published")
+        self.ov.net.connected = False
+        self.ov._duel_tick(time.time())
+        self.assertEqual(self.status(), "Waiting for the relay connection.")
+        self.ov.net.connected = True
+        self.ov._duel_tick(time.time())
+        self.assertEqual(self.status(), "Round 1: pick your move (1-7)")
 
 
 class NumberGuesserTests(unittest.TestCase):

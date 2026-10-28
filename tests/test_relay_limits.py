@@ -33,24 +33,15 @@ class OutboxTests(unittest.TestCase):
         self.assertIsNotNone(job)
         self.out.published(job.msg["id"], "receipt-" + mid)
 
-    def test_shared_room_uses_twelve_request_burst_and_five_second_refill(self):
-        others = chat.RelayOutbox(queue.Queue(), clock=self.clock.mono,
-                                 wall=self.clock.wall)
-        for out in (self.out, others):
-            out.set_members(2)
-            for i in range(7):
-                out.enqueue(packet(str(i)))
-            for _ in range(6):
-                job = out.take()
-                self.assertIsNotNone(job)
-                out.published(job.msg["id"])
-            self.assertIsNone(out.take())
-        self.clock.advance(5)
+    def test_default_burst_and_exact_five_second_refill(self):
+        for i in range(60):
+            self.publish(str(i))
+        self.out.enqueue(packet("next"))
         self.assertIsNone(self.out.take())
-        self.assertIsNone(others.take())
-        self.clock.advance(5)
-        self.assertIsNotNone(self.out.take())
-        self.assertIsNotNone(others.take())
+        self.clock.advance(4.999)
+        self.assertIsNone(self.out.take())
+        self.clock.advance(.001)
+        self.assertEqual(self.out.take().msg["id"], "next")
 
     def test_request_cooldown_includes_game_chat_terminal_and_read_requests(self):
         for mid, op in (("game", "commit"), ("chat", None), ("quit", "quit")):
@@ -62,20 +53,44 @@ class OutboxTests(unittest.TestCase):
         self.clock.advance(1)
         job = self.out.take()
         self.assertEqual(job.msg["id"], "quit")
-        self.assertEqual(self.out.penalty, 2)
+        self.out.published("quit")
+        self.assertIsNone(self.out.take())  # only one request at cooldown expiry
+        self.clock.advance(5)
+        self.assertEqual(self.out.take().msg["id"], "chat")
 
-    def test_backoff_is_capped_and_recovery_is_gradual(self):
+    def test_backoff_is_capped_and_idle_restores_normal_capacity(self):
         for i, expected in enumerate((15, 30, 60, 120, 240, 300, 300)):
             self.out.throttle(42901)
             self.assertEqual(self.out.cool_until - self.clock.mono(), expected)
             self.clock.advance(expected)
-        self.assertEqual(self.out.penalty, 8)
-        self.clock.advance(60)
-        self.publish("one")
-        self.assertEqual(self.out.penalty, 4)
-        self.clock.advance(60)
-        self.publish("two")
-        self.assertEqual(self.out.penalty, 2)
+        self.clock.advance(600)
+        for i in range(60):
+            self.publish(f"after-idle-{i}")
+        self.out.enqueue(packet("next"))
+        self.assertIsNone(self.out.take())
+        self.clock.advance(5)
+        self.assertIsNotNone(self.out.take())
+
+    def test_only_fresh_post_cooldown_http_success_resets_streak(self):
+        old_stamp = self.out.request_stamp()
+        self.out.enqueue(packet("echo"))
+        self.out.throttle(42901, 15)
+        self.clock.advance(15)
+        self.out.published("echo")
+        self.out.http_success(old_stamp)
+        self.assertEqual(self.out.cool_n, 1)
+        self.out.http_success(self.out.request_stamp())
+        self.assertEqual(self.out.cool_n, 0)
+        self.out.throttle(42901)
+        self.assertEqual(self.out.cool_until - self.clock.mono(), 15)
+
+    def test_zero_retry_after_allows_one_request_immediately(self):
+        self.out.throttle(42901, 0)
+        self.publish("probe")
+        self.out.enqueue(packet("next"))
+        self.assertIsNone(self.out.take())
+        self.clock.advance(5)
+        self.assertIsNotNone(self.out.take())
 
     def test_chat_can_pass_game_retry_but_game_events_stay_in_order(self):
         self.out.enqueue(packet("commit", "commit"))
@@ -173,7 +188,6 @@ class OutboxTests(unittest.TestCase):
 
     def test_settings_allow_custom_relay_limits(self):
         with patch.object(chat, "RELAY_REFILL_SECONDS", 1), patch.object(chat, "RELAY_BURST", 1):
-            self.out.set_members(1)
             self.publish("one")
             self.out.enqueue(packet("two"))
             self.assertIsNone(self.out.take())
@@ -193,8 +207,86 @@ class OutboxTests(unittest.TestCase):
         self.assertEqual(self.out.retry_failed(), 0)
         self.assertIsNone(self.out.take())
 
+    def test_wait_metadata_is_distinct_and_diagnostics_exclude_content(self):
+        diagnostics = []
+        self.out.logger = diagnostics.append
+        self.out.tokens = 0
+        self.out.enqueue(packet("move", "commit", text="PRIVATE CONTENT", name="PRIVATE NAME"))
+        self.assertIsNone(self.out.take())
+        job = self.out.jobs["move"]
+        self.assertEqual((job.reason, job.http_code), ("budget", None))
+        self.assertEqual(job.retry_at, self.clock.mono() + 5)
+        self.out.throttle(42901, 30, "duel")
+        self.assertIsNone(self.out.take())
+        self.assertEqual((job.reason, job.http_code), ("server_limit", 429))
+        self.assertEqual(job.retry_at, self.clock.mono() + 30)
+        before = len(diagnostics)
+        for _ in range(4):
+            self.clock.advance(.25)
+            self.out.take()
+        self.assertEqual(len(diagnostics), before)
+        self.out.throttle(42908, category="duel")
+        self.out.take()
+        self.assertEqual(job.reason, "daily_quota")
+        logs = "\n".join(diagnostics)
+        self.assertIn("reason=budget category=duel duration=5.0s http=-", logs)
+        self.assertIn("reason=server_limit category=duel duration=30.0s http=429", logs)
+        self.assertNotIn("PRIVATE", logs)
+
+    def test_saved_custom_limits_are_not_migrated_to_new_defaults(self):
+        with tempfile.TemporaryDirectory() as folder:
+            settings = os.path.join(folder, "settings.json")
+            with open(settings, "w") as f:
+                json.dump({"RELAY_BURST": 12, "RELAY_REFILL_SECONDS": 7}, f)
+            with patch.object(chat, "SETTINGS_PATH", settings), \
+                    patch.object(chat, "RELAY_BURST", 60), \
+                    patch.object(chat, "RELAY_REFILL_SECONDS", 5):
+                chat.load_settings()
+                self.assertEqual(chat.RELAY_BURST, 12)
+                self.assertEqual(chat.RELAY_REFILL_SECONDS, 7)
+
 
 class RelayHTTPTests(unittest.TestCase):
+    def test_shared_server_budget_backoffs_without_changing_match(self):
+        room = Room(8)
+        publish = room.publish
+        server = {"tokens": 60.0, "last": room.clock.mono(), "limited": 0}
+        def rate_limited(net, req):
+            now = room.clock.mono()
+            self.assertGreaterEqual(now, net.outbox.cool_until)
+            server["tokens"] = min(60, server["tokens"] + (now - server["last"]) / 5)
+            server["last"] = now
+            if server["tokens"] < 1:
+                server["limited"] += 1
+                raise urllib.error.HTTPError(net.base, 429, "request limit",
+                    {"Retry-After": "5"}, io.BytesIO(b'{"code":42901}'))
+            server["tokens"] -= 1
+            return publish(net, req)
+        room.publish = rate_limited
+        room.start()
+        for _ in range(50):
+            for ov in room.clients[:2]:
+                ov._duel_pick("wait")
+            room.flush()
+        self.assertGreater(server["limited"], 0)
+        self.assertLessEqual(server["limited"], 100)
+        self.assertEqual(len(room.messages), 154)
+        self.assertEqual(room.clients[0].duel["S"], room.clients[1].duel["S"])
+        self.assertTrue(all(ov.duel["over"] for ov in room.clients[:2]))
+        for msg in room.packets():
+            self.assertTrue({"reason", "retry_at", "http_code"}.isdisjoint(msg))
+            self.assertTrue({"reason", "retry_at", "http_code"}.isdisjoint(msg.get("duel2", {})))
+
+    def test_successful_http_read_resets_request_backoff(self):
+        room = Room()
+        net = room.clients[0].net
+        net.outbox.throttle(42901, 15)
+        room.clock.advance(15)
+        net._open = Mock(return_value=io.BytesIO(b'{}'))
+        with net._read_open(chat.urllib.request.Request(net.base + "/v1/health"), 8):
+            pass
+        self.assertEqual(net.outbox.cool_n, 0)
+
     def test_retry_after_seconds_date_and_invalid_header(self):
         for raw, expected in (("120", 120), ("Thu, 01 Jan 1970 00:02:00 GMT", 20),
                               ("invalid", None)):
