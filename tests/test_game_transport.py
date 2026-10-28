@@ -450,7 +450,7 @@ class DuelHandshakeTests(unittest.TestCase):
         })
 
         host._duel_send.assert_called_once_with({
-            "op": "start", "p2": "guest", "n1": "Player",
+            "op": "start", "p2": "guest", "n1": "Player", "n2": "Guest",
         })
         host._duel_start.assert_called_once_with(
             ["host", "guest"], ["Player", "Guest"])
@@ -578,6 +578,166 @@ class DuelRematchTests(unittest.TestCase):
         guest._duel_msg(message)
 
         guest._duel_restart.assert_not_called()
+
+
+class DuelSpectatorTests(unittest.TestCase):
+    def overlay(self, uid):
+        ov = chat.Overlay.__new__(chat.Overlay)
+        ov.net = Mock()
+        ov.net.uid, ov.net.name = uid, "Observer"
+        ov.root = Mock()
+        ov.duel = None
+        ov._duel_send = Mock()
+        ov._duel_window = Mock()
+        ov._duel_begin_round = Mock()
+        ov._duel_close_popup = Mock()
+        ov._duel_close_window = Mock()
+        ov._duel_spectator_snapshot = Mock()
+        ov._duel_send_snapshot = Mock()
+        ov.note = Mock()
+        return ov
+
+    def test_nonselected_invite_does_not_open_a_spectator_automatically(self):
+        watcher = self.overlay("observer")
+        watcher.duel = {
+            "gid": "0123456789ab", "host_uid": "host", "host": "Host",
+            "mine": False, "state": "accepting", "over": False,
+            "uids": [None, None], "names": ["", ""],
+        }
+        watcher._duel_over = Mock()
+
+        watcher._duel_msg({
+            "uid": "host", "name": "Host",
+            "duel": {"op": "start", "gid": "0123456789ab",
+                     "p2": "guest", "n1": "Host", "n2": "Guest"},
+        })
+
+        watcher._duel_over.assert_called_once_with()
+
+    def test_watch_list_request_gets_answer_from_active_host(self):
+        host = self.overlay("host")
+        host.duel = {
+            "mine": True, "state": "playing", "over": False,
+            "solo": False, "uids": ["host", "guest"],
+        }
+
+        host._duel_msg({
+            "uid": "observer", "name": "Observer",
+            "duel": {"op": "watch_list"},
+        })
+
+        host._duel_send_snapshot.assert_called_once_with("observer")
+
+    def test_host_snapshot_includes_target_and_resumable_state(self):
+        host = self.overlay("host")
+        state = chat.duel_new()
+        state["round"] = 2
+        host.duel = {
+            "S": state, "over": False, "uids": ["host", "guest"],
+            "names": ["Host", "Guest"], "anim": False, "picks": {},
+            "r": 3, "last": "Turn recap", "gid": "0123456789ab",
+        }
+
+        chat.Overlay._duel_send_snapshot(host, "observer")
+
+        host._duel_send.assert_called_once_with({
+            "op": "snap", "p2": "observer", "u2": "guest",
+            "n1": "Host", "n2": "Guest", "r": 3,
+            "S": state, "picks": [], "last": "Turn recap",
+        })
+
+    def test_watch_command_broadcasts_a_duel_discovery_request(self):
+        watcher = self.overlay("observer")
+
+        chat.Overlay._duel_watch_cmd(watcher)
+
+        watcher.net.send.assert_called_once_with(
+            "", kind="ping", extra={"duel": {"op": "watch_list"}})
+
+    def test_watch_list_snapshot_starts_a_late_joining_spectator(self):
+        watcher = self.overlay("observer")
+        state = chat.duel_new()
+        state["round"] = 3
+
+        watcher._duel_msg({
+            "uid": "host", "name": "Host",
+            "duel": {
+                "op": "snap", "gid": "0123456789ab", "p2": "observer",
+                "u2": "guest", "n1": "Host", "n2": "Guest",
+                "r": 4, "S": state, "picks": [], "last": "Turn recap",
+            },
+        })
+
+        self.assertTrue(watcher.duel["spectator"])
+        self.assertEqual(watcher.duel["uids"], ["host", "guest"])
+        watcher._duel_spectator_snapshot.assert_called_once()
+
+    def test_second_discovery_snapshot_cannot_replace_active_spectate(self):
+        watcher = self.overlay("observer")
+        watcher.duel = {
+            "gid": "111111111111", "host_uid": "host-a", "host": "Host A",
+            "mine": False, "state": "playing", "over": False,
+            "uids": ["host-a", "guest-a"], "names": ["Host A", "Guest A"],
+            "spectator": True,
+        }
+        state = chat.duel_new()
+
+        watcher._duel_msg({
+            "uid": "host-b", "name": "Host B",
+            "duel": {
+                "op": "snap", "gid": "222222222222", "p2": "observer",
+                "u2": "guest-b", "n1": "Host B", "n2": "Guest B",
+                "r": 1, "S": state, "picks": [], "last": "",
+            },
+        })
+
+        self.assertEqual(watcher.duel["gid"], "111111111111")
+        watcher._duel_spectator_snapshot.assert_not_called()
+
+    def test_snapshot_schema_rejects_out_of_arena_positions(self):
+        state = chat.duel_new()
+        state["p"][0]["x"] = chat.DUEL_W + 1
+
+        self.assertFalse(chat.Overlay._duel_valid_snapshot(state))
+
+    def test_snapshot_schema_rejects_non_string_move(self):
+        state = chat.duel_new()
+        state["p"][0]["move"] = []
+
+        self.assertFalse(chat.Overlay._duel_valid_snapshot(state))
+
+    def test_spectator_cannot_submit_a_fighter_move(self):
+        watcher = self.overlay("observer")
+        watcher.duel = {
+            "state": "playing", "over": False, "anim": False,
+            "spectator": True,
+        }
+
+        chat.Overlay._duel_pick(watcher, "jab")
+
+        watcher._duel_send.assert_not_called()
+
+    def test_spectator_accepts_targeted_valid_snapshot(self):
+        watcher = self.overlay("observer")
+        watcher.duel = {
+            "gid": "0123456789ab", "host_uid": "host", "host": "Host",
+            "mine": False, "state": "playing", "over": False,
+            "uids": ["host", "guest"], "names": ["Host", "Guest"],
+            "S": chat.duel_new(), "r": 1, "picks": {}, "last": "",
+            "spectator": True,
+        }
+        state = chat.duel_new()
+        state["round"] = 4
+        packet = {"p2": "observer", "S": state, "r": 5,
+                  "picks": [[5, 0, "jab"]], "last": "Recent turn"}
+
+        chat.Overlay._duel_spectator_snapshot(watcher, packet)
+
+        self.assertEqual(watcher.duel["S"], state)
+        self.assertEqual(watcher.duel["r"], 5)
+        self.assertEqual(watcher.duel["picks"], {(5, 0): "jab"})
+        self.assertEqual(watcher.duel["last"], "Recent turn")
+        watcher._duel_begin_round.assert_called_once_with()
 
 
 class DuelStatusTests(unittest.TestCase):

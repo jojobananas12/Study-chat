@@ -61,6 +61,7 @@ Commands: /disconnect (or /quit), /getfonts (install the free fonts your friends
   Edge or Brave, or pywebview), /reelgif (send a GIF of the reel; same as
   the "gif" button, "/reelgif area" picks the screen area again),
   /duel (challenge the room to a tiny turn-based fighting game),
+  /duel watch (watch an active duel),
   /duel solo (test it alone: you control both fighters),
   /who (who's online), /update (check for a new version),
   /version, /settings, /img, /quit. The chat checks GitHub for a newer
@@ -2165,6 +2166,7 @@ class SettingsWindow:
         self.vars, self.swatches = {}, {}
         self.loading = False
         self.job = None
+        self.closed = False
         self._picking = False
         try:
             from tkinter import font as tkfont
@@ -2335,25 +2337,51 @@ class SettingsWindow:
         self._load_all(DEFAULTS)
 
     def cancel(self):
-        self._load_all(self.snapshot)
-        self.close()
+        try:
+            self._load_all(self.snapshot)
+        except Exception:
+            log("couldn't restore settings while closing: "
+                + traceback.format_exc())
+        finally:
+            self.close()
 
     def save(self):
-        ok = save_settings()
-        self.close()
+        try:
+            ok = save_settings()
+        except Exception:
+            log("couldn't save settings while closing: "
+                + traceback.format_exc())
+            ok = False
+        finally:
+            self.close()
         if not ok:
             self.ov.note("couldn't save your settings file")
 
     def close(self):
+        if self.closed:
+            return
+        self.closed = True
         if self.job:
             try:
                 self.win.after_cancel(self.job)
             except Exception:
-                pass
-        self.ov.settings_win = None
+                log("couldn't cancel settings preview: "
+                    + traceback.format_exc())
+            self.job = None
+        if self.ov.settings_win is self:
+            self.ov.settings_win = None
         self.ov.busy = False
-        self.win.destroy()
-        self.ov._focus_entry()
+        try:
+            self.win.destroy()
+        except Exception:
+            log("couldn't destroy settings window: "
+                + traceback.format_exc())
+        finally:
+            try:
+                self.ov._focus_entry()
+            except Exception:
+                log("couldn't restore chat focus after settings: "
+                    + traceback.format_exc())
 
 
 # ------------------------------------------------------------------------ UI
@@ -3312,10 +3340,14 @@ class Overlay:
         else:
             m.add_command(label="Number guesser...", command=self.game_cmd)
         if self.duel and not self.duel["over"]:
-            m.add_command(label="Quit the duel" if self.duel["state"] == "playing"
-                          else "Cancel the duel", command=self.duel_quit_cmd)
+            label = ("Stop spectating" if self.duel.get("spectator") else
+                     "Quit the duel" if self.duel["state"] == "playing" else
+                     "Cancel the duel")
+            m.add_command(label=label, command=self.duel_quit_cmd)
         else:
             m.add_command(label="Duel...", command=self.duel_cmd)
+            m.add_command(label="Watch duel in progress",
+                          command=self._duel_watch_cmd)
             m.add_command(label="Duel solo (testing)",
                           command=self.duel_solo_cmd)
         m.add_command(label="Flip everyone's chat", command=self.flip_cmd)
@@ -4008,6 +4040,9 @@ class Overlay:
         if text == "/duel":
             self.duel_cmd()
             return
+        if text == "/duel watch":
+            self._duel_watch_cmd()
+            return
         if text in ("/duel solo", "/solo"):
             self.duel_solo_cmd()
             return
@@ -4543,11 +4578,11 @@ class Overlay:
     # identical fight with duel_round(), so the only thing ever sent is a
     # pick: ONE small message per pick, and none at all on a turn where a
     # player has no choice (winding up a heavy, or stunned). The free relay
-    # allows very few posts a minute, so there are no acks, no commit/reveal
-    # step and no polling. A pick is only said again if the other side stays
-    # silent for a long time, and then only a few times.
+    # allows very few posts a minute, so there is no per-turn ack or polling.
+    # Spectators can request a single state snapshot; gameplay picks are only
+    # said again if the other side stays silent for a long time.
     # Messages (all inside a "duel" ping, so old versions ignore them):
-    #   challenge / cancel / accept / start
+    #   challenge / cancel / accept / start / watch / watch_list / snap
     #   p  = a pick {r: turn, m: move}. The challenger's first pick also
     #        says who was chosen (vs) for older peers.
     #   n  = "I'm stuck on turn r, please say your pick again"
@@ -4565,7 +4600,8 @@ class Overlay:
                 "hist": {}, "pick": None, "anim": False, "win": None,
                 "ui": None, "accept_at": 0, "accept_n": 0, "last": "",
                 "pop": None, "out": None, "resends": 0, "next_resend": 0,
-                "reply_at": {}, "go": None, "quit": False}
+                "reply_at": {}, "go": None, "quit": False,
+                "spectator_requests": {}}
 
     def duel_cmd(self):
         """/duel or the menu: challenge the room (or cancel your challenge)."""
@@ -4585,6 +4621,14 @@ class Overlay:
         self.note("you challenged the room to a duel. Waiting for someone "
                   "to accept (type /duel again to cancel)")
 
+    def _duel_watch_cmd(self):
+        D = self.duel
+        if D and not D["over"]:
+            self.note("finish or stop your current duel before spectating")
+            return
+        self.net.send("", kind="ping", extra={"duel": {"op": "watch_list"}})
+        self.note("looking for a duel in progress...")
+
     def duel_solo_cmd(self):
         """Testing: one person plays both fighters. Nothing is sent."""
         D = self.duel
@@ -4601,6 +4645,9 @@ class Overlay:
     def duel_quit_cmd(self):
         D = self.duel
         if not D or D["over"]:
+            return
+        if D.get("spectator"):
+            self._duel_close_window()
             return
         if D["state"] == "playing":
             self._duel_forfeit()
@@ -4644,6 +4691,13 @@ class Overlay:
         if not isinstance(uid, str) or not uid:
             return
         op, gid = d.get("op"), d.get("gid")
+        if op == "watch_list":
+            D = self.duel
+            if (D and D["mine"] and D["state"] == "playing"
+                    and not D["over"] and not D.get("solo")
+                    and uid not in D["uids"]):
+                self._duel_send_snapshot(uid)
+            return
         if not (isinstance(gid, str) and re.fullmatch(r"[0-9a-f]{12}", gid)):
             return
         D = self.duel
@@ -4657,6 +4711,18 @@ class Overlay:
                 self._duel_popup()
             except Exception:
                 log("duel popup failed: " + traceback.format_exc())
+            return
+        if op == "start" and (not D or D["gid"] != gid):
+            return
+        if op == "snap" and d.get("p2") == self.net.uid \
+                and (not D or D["gid"] != gid or D["over"]):
+            u2, n1, n2 = d.get("u2"), d.get("n1"), d.get("n2")
+            if (isinstance(u2, str) and u2 and isinstance(n1, str)
+                    and isinstance(n2, str) and uid != self.net.uid):
+                self._duel_spectator_start(gid, uid, n1[:20], u2, n2[:20])
+                if (self.duel and self.duel["gid"] == gid
+                        and self.duel.get("spectator")):
+                    self._duel_spectator_snapshot(d)
             return
         if not D or D["gid"] != gid:
             return
@@ -4677,7 +4743,7 @@ class Overlay:
             # The first accept wins. A separate start message opens both
             # duel windows before either player has to pick a move.
             self._duel_send({"op": "start", "p2": uid,
-                             "n1": self.net.name})
+                             "n1": self.net.name, "n2": name})
             self._duel_start([self.net.uid, uid], [self.net.name, name])
             D["go"] = {"vs": uid, "n1": name}
             self.note(f"{name} accepted your duel! Pick your first move")
@@ -4685,7 +4751,8 @@ class Overlay:
                 and uid == D["uids"][1]:
             if D["hist"].get(1) is None:
                 self._duel_send({"op": "start", "p2": uid,
-                                 "n1": self.net.name})
+                                 "n1": self.net.name,
+                                 "n2": D["names"][1]})
             else:
                 self._duel_reply(1)                  # they missed our pick
         elif op == "start" and not D["mine"] \
@@ -4707,9 +4774,123 @@ class Overlay:
                 self._duel_take(msg, d, uid)
             else:
                 self._duel_over()                    # someone else was picked
+        elif op == "watch" and D["mine"] and D["state"] == "playing" \
+                and not D.get("spectator"):
+            self._duel_send_snapshot(uid)
         elif D["state"] == "playing" and uid in D["uids"] \
                 and uid != self.net.uid:
-            self._duel_take(msg, d, uid)
+            if D.get("spectator") and op == "snap" and uid == D["host_uid"]:
+                self._duel_spectator_snapshot(d)
+            elif D.get("spectator") and op == "q":
+                self._duel_finish(1 - D["uids"].index(uid), "forfeit")
+            elif op == "watch" and D["mine"] and not D.get("spectator"):
+                self._duel_send_snapshot(uid)
+            else:
+                self._duel_take(msg, d, uid)
+
+    def _duel_spectator_start(self, gid, host_uid, host_name, guest_uid,
+                              guest_name):
+        D = self.duel
+        if D and not D["over"] and D.get("gid") != gid:
+            return
+        if D and D.get("gid") == gid and D.get("spectator"):
+            return
+        if D:
+            self._duel_close_popup()
+            if D.get("win"):
+                self._duel_close_window()
+        D = self._duel_blank(gid, host_uid, host_name, False)
+        D.update(state="playing", uids=[host_uid, guest_uid],
+                 names=[host_name, guest_name], me=0, S=duel_new(),
+                 r=1, spectator=True, picks={}, hist={})
+        self.duel = D
+        self.note(f"Watching {host_name} vs {guest_name}")
+        self._duel_window()
+        self._duel_begin_round()
+
+    def _duel_send_snapshot(self, uid):
+        D = self.duel
+        if (not D or not D.get("S") or D["over"]
+                or not isinstance(uid, str) or len(uid) > 100
+                or uid in D["uids"]):
+            return
+        now = time.time()
+        requests = D.setdefault("spectator_requests", {})
+        if now - requests.get(uid, 0) < 3:
+            return
+        requests[uid] = now
+        pending = []
+        if not D["anim"]:
+            pending = [[r, i, move] for (r, i), move in D["picks"].items()
+                       if r == D["r"]]
+        self._duel_send({
+            "op": "snap", "p2": uid, "u2": D["uids"][1],
+            "n1": D["names"][0], "n2": D["names"][1],
+            "r": D["S"]["round"] + 1 if D["anim"] else D["r"],
+            "S": D["S"], "picks": pending,
+            "last": D["last"][:300],
+        })
+
+    @staticmethod
+    def _duel_valid_snapshot(state):
+        if not isinstance(state, dict):
+            return False
+        players = state.get("p")
+        if not isinstance(players, list) or len(players) != 2:
+            return False
+        for fighter in players:
+            if not isinstance(fighter, dict):
+                return False
+            x, facing = fighter.get("x"), fighter.get("f")
+            hp, stun = fighter.get("hp"), fighter.get("stun")
+            move, timer = fighter.get("move"), fighter.get("t")
+            if (type(x) is not int or not 0 <= x <= DUEL_W
+                    or type(facing) is not int or facing not in (-1, 1)
+                    or type(hp) is not int or not 0 <= hp <= DUEL_HP
+                    or type(stun) is not int or not 0 <= stun <= 100
+                    or type(timer) is not int or not 0 <= timer <= 100
+                    or (move is not None and (
+                        not isinstance(move, str) or move not in DUEL_MOVES))):
+                return False
+        winner = state.get("winner")
+        return (type(state.get("round")) is int
+                and 0 <= state["round"] <= 100000
+                and type(state.get("over")) is bool
+                and (winner is None or
+                     (type(winner) is int and winner in (-1, 0, 1))))
+
+    def _duel_spectator_snapshot(self, d):
+        D = self.duel
+        if (not D or not D.get("spectator")
+                or d.get("p2") != self.net.uid
+                or D.get("anim")
+                or not self._duel_valid_snapshot(d.get("S"))):
+            return
+        round_no = self._whole(d.get("r"), 1, 100000)
+        if round_no is None:
+            return
+        if D["S"] and d["S"]["round"] < D["S"]["round"]:
+            return
+        picks = {}
+        raw_picks = d.get("picks", [])
+        if not isinstance(raw_picks, list) or len(raw_picks) > 2:
+            return
+        for item in raw_picks:
+            if (not isinstance(item, list) or len(item) != 3
+                    or type(item[0]) is not int or item[0] != round_no
+                    or type(item[1]) is not int or item[1] not in (0, 1)
+                    or not isinstance(item[2], str)
+                    or item[2] not in DUEL_MOVES):
+                return
+            picks[(item[0], item[1])] = item[2]
+        D["S"] = d["S"]
+        D["r"] = round_no
+        D["picks"] = picks
+        D["last"] = str(d.get("last", ""))[:300]
+        if D["S"]["over"]:
+            self._duel_finish(D["S"]["winner"], "ko")
+        else:
+            self._duel_begin_round()
 
     def _duel_take(self, msg, d, uid):
         """A pick, a nudge or a quit from our opponent."""
@@ -4725,7 +4906,8 @@ class Overlay:
         if d.get("re") == 1:
             self._duel_reply(r)          # they are missing something of ours
         m = d.get("m")
-        if (op == "p" and m in DUEL_MOVES and D["r"] <= r <= D["r"] + 3
+        if (op == "p" and isinstance(m, str) and m in DUEL_MOVES
+                and D["r"] <= r <= D["r"] + 3
                 and (r, idx) not in D["picks"]):
             D["picks"][(r, idx)] = m
             self._duel_progress()
@@ -5071,6 +5253,8 @@ class Overlay:
         D = self.duel
         if not D:
             return
+        if D.get("spectator") and not D["over"]:
+            D["over"] = True
         if D.get("solo"):
             D["over"] = True                 # no forfeit question when alone
         if D["state"] == "playing" and not D["over"]:
@@ -5088,7 +5272,7 @@ class Overlay:
 
     def _duel_forfeit(self):
         D = self.duel
-        if D.get("solo"):
+        if D.get("solo") or D.get("spectator"):
             self._duel_close_window()
             return
         from tkinter import messagebox
@@ -5143,9 +5327,15 @@ class Overlay:
                            text=f"{D['names'][i]}  {max(0, p['hp'])}/{DUEL_HP}",
                            fill=DUEL_COLS[i], font=font, tags="fg",
                            anchor="nw" if i == 0 else "ne")
-        perspective = 0 if D.get("solo") else D["me"]
+        perspective = 0 if D.get("solo") or D.get("spectator") else D["me"]
         advantage = duel_turn_lead(D["S"], perspective)
-        if advantage > 0:
+        if D.get("spectator") and advantage > 0:
+            lead_text, lead_color = f"{D['names'][0]} +{advantage} turns", \
+                "#7be08a"
+        elif D.get("spectator") and advantage < 0:
+            lead_text, lead_color = f"{D['names'][1]} +{-advantage} turns", \
+                "#7be08a"
+        elif advantage > 0:
             lead_text = f"+{advantage} turns"
             lead_color = "#7be08a"
         elif advantage < 0:
@@ -5181,6 +5371,14 @@ class Overlay:
         need = duel_need(S)
         ui = D.get("ui")
         me = D["me"]
+        if D.get("spectator"):
+            self._duel_buttons(False)
+            if ui:
+                ui["status"].config(
+                    text=f"Spectating — Turn {D['r']}", fg=MUTED)
+                ui["info"].config(text=D["last"])
+            self._duel_progress()
+            return
         if ui and D.get("solo"):
             n = D["r"]
             self._duel_buttons(bool(need))
@@ -5229,7 +5427,8 @@ class Overlay:
     def _duel_pick(self, move):
         D = self.duel
         if (not D or D["state"] != "playing" or D["over"] or D["anim"]
-                or D["pick"] is not None or move not in DUEL_MOVES):
+                or D.get("spectator") or D["pick"] is not None
+                or move not in DUEL_MOVES):
             return
         S, me, r = D["S"], D["me"], D["r"]
         if D.get("solo"):                    # fill in whoever still needs one
@@ -5360,7 +5559,7 @@ class Overlay:
         n = D["names"]
         if winner == -1:
             text = "Draw!"
-        elif D.get("solo"):
+        elif D.get("solo") or D.get("spectator"):
             text = f"{n[winner]} wins!"
         elif winner == D["me"]:
             text = "You win!" + (" (they forfeited)" if why == "forfeit" else "")
@@ -5369,14 +5568,19 @@ class Overlay:
         ui = D.get("ui")
         if ui:
             ui["status"].config(
-                text=text, fg=(DUEL_COLS[winner] if D.get("solo") and winner != -1
+                text=text, fg=(DUEL_COLS[winner]
+                               if (D.get("solo") or D.get("spectator"))
+                               and winner != -1
                                else "#7be08a" if winner == D["me"]
                                else "#ff7a7a" if winner != -1 else FG))
-            ui["info"].config(text=D["last"] +
-                              "\nRematch or close this window when done.")
+            suffix = ("\nClose this window to stop spectating."
+                      if D.get("spectator") else
+                      "\nRematch or close this window when done.")
+            ui["info"].config(text=D["last"] + suffix)
             ui["rematch"].config(
-                state="normal", text="Rematch" if not D.get("solo")
-                else "Play again")
+                state="disabled" if D.get("spectator") else "normal",
+                text=("Spectating" if D.get("spectator") else
+                      "Rematch" if not D.get("solo") else "Play again"))
             self._duel_buttons(False)
         if D["mine"] and not D.get("solo"):          # the host tells the room
             hp = [p["hp"] for p in D["S"]["p"]] if D["S"] else [0, 0]
