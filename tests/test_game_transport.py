@@ -2,12 +2,14 @@
 import copy
 import io
 import json
+import os
 import queue
 import random
+import tempfile
 import threading
 import time
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import studychat as chat
 
@@ -200,6 +202,141 @@ class DuelProtocolTests(unittest.TestCase):
             if expected["over"]:
                 break
 
+    def test_dash_moves_two_then_one_and_opponent_acts_each_turn(self):
+        state = chat.duel_new()
+
+        chat.duel_round(state, {0: "dash", 1: "wait"})
+
+        self.assertEqual(state["p"][0]["x"], chat.DUEL_START[0] + 2)
+        self.assertEqual(state["p"][0]["move"], "dash")
+        self.assertEqual(chat.duel_need(state), [1])
+        self.assertEqual(chat.duel_turn_lead(state, 0), -1)
+        self.assertEqual(
+            chat.duel_move_tiles("dash", 3, 1), ([4, 5, 6], "move"))
+
+        chat.duel_round(state, {1: "wait"})
+
+        self.assertEqual(state["p"][0]["x"], chat.DUEL_START[0] + 3)
+        self.assertIsNone(state["p"][0]["move"])
+        self.assertEqual(chat.duel_turn_lead(state, 0), 0)
+        self.assertEqual(chat.duel_need(state), [0, 1])
+
+    def test_selected_direction_controls_advance_and_dash(self):
+        self.assertEqual(
+            chat.duel_movement_action("forward", "advance"), "advance")
+        self.assertEqual(
+            chat.duel_movement_action("back", "advance"), "retreat")
+        self.assertEqual(
+            chat.duel_movement_action("forward", "dash"), "dash")
+        self.assertEqual(
+            chat.duel_movement_action("back", "dash"), "dash_back")
+
+        state = chat.duel_new()
+        chat.duel_round(state, {0: "dash_back", 1: "wait"})
+        self.assertEqual(state["p"][0]["x"], chat.DUEL_START[0] - 2)
+        self.assertEqual(state["p"][0]["move"], "dash_back")
+        chat.duel_round(state, {1: "wait"})
+        self.assertEqual(state["p"][0]["x"], chat.DUEL_START[0] - 3)
+
+    def test_successful_grab_costs_two_turns_for_target(self):
+        state = chat.duel_new()
+        state["p"][1]["x"] = state["p"][0]["x"] + 1
+
+        _, events = chat.duel_round(state, {0: "grab", 1: "wait"})
+
+        self.assertEqual(state["p"][1]["stun"], 2)
+        self.assertEqual(chat.duel_turn_lead(state, 0), 2)
+        self.assertIn("grab:1", events)
+        chat.duel_round(state, {0: "wait"})
+        self.assertEqual(state["p"][1]["stun"], 1)
+        chat.duel_round(state, {0: "wait"})
+        self.assertEqual(state["p"][1]["stun"], 0)
+
+    def test_frame_advantage_draws_signed_and_centered_between_healthbars(self):
+        state = chat.duel_new()
+        state["p"][1]["stun"] = 1
+        overlay = chat.Overlay.__new__(chat.Overlay)
+        canvas = Mock()
+        gid = "0123456789ab"
+        overlay.duel = {
+            "ui": {"cv": canvas}, "gid": gid, "r": 1, "stage": 0,
+            "bg_off": (0, 0), "fx": Mock(offset=Mock(return_value=(0, 0))),
+            "phase": 0, "goal": None, "hl": None, "me": 0, "solo": False,
+            "S": state, "names": ["Player 0", "Player 1"],
+        }
+        frame = chat.duel_frame(state)
+
+        with patch.object(chat, "duel_stage_for", return_value=0), \
+                patch.object(chat, "duel_tile_rects", return_value=[]), \
+                patch.object(chat, "duel_fg_rects", return_value=[]):
+            overlay._duel_draw(frame)
+
+        indicator = next(call for call in canvas.create_text.call_args_list
+                         if call.kwargs.get("text") == "+8 frames")
+        self.assertEqual(indicator.args, (400, 16))
+        self.assertEqual(indicator.kwargs["fill"], "#7be08a")
+        self.assertEqual(indicator.kwargs["anchor"], "n")
+
+        canvas.reset_mock()
+        overlay.duel["me"] = 1
+        with patch.object(chat, "duel_stage_for", return_value=0), \
+                patch.object(chat, "duel_tile_rects", return_value=[]), \
+                patch.object(chat, "duel_fg_rects", return_value=[]):
+            overlay._duel_draw(frame)
+
+        indicator = next(call for call in canvas.create_text.call_args_list
+                         if call.kwargs.get("text") == "-8 frames")
+        self.assertEqual(indicator.kwargs["fill"], "#ff7a7a")
+
+    def test_failed_grab_costs_three_turns_for_grabber(self):
+        state = chat.duel_new()
+
+        _, events = chat.duel_round(state, {0: "grab", 1: "wait"})
+
+        self.assertEqual(state["p"][0]["stun"], 3)
+        self.assertEqual(chat.duel_turn_lead(state, 1), 3)
+        self.assertIn("grab_fail:0:3", events)
+
+    def test_grabbing_jabber_fails_and_costs_four_turns(self):
+        state = chat.duel_new()
+        state["p"][1]["x"] = state["p"][0]["x"] + 1
+
+        _, events = chat.duel_round(state, {0: "grab", 1: "jab"})
+
+        self.assertEqual(state["p"][0]["stun"], 4)
+        self.assertIn("grab_fail:0:4", events)
+
+    def test_grabbing_heavy_windup_fails_and_costs_three_turns(self):
+        state = chat.duel_new()
+        state["p"][1]["x"] = state["p"][0]["x"] + 1
+        state["p"][1]["move"] = "heavy"
+
+        _, events = chat.duel_round(state, {0: "grab"})
+
+        self.assertEqual(state["p"][0]["stun"], 3)
+        self.assertEqual(state["p"][1]["hp"], chat.DUEL_HP)
+        self.assertIn("grab_fail:0:3", events)
+
+    def test_grabbing_during_heavy_windup_fails_without_canceling_attack(self):
+        state = chat.duel_new()
+        state["p"][1]["x"] = state["p"][0]["x"] + 1
+
+        _, events = chat.duel_round(state, {0: "grab", 1: "heavy"})
+
+        self.assertEqual(state["p"][0]["stun"], 3)
+        self.assertEqual(state["p"][1]["move"], "heavy")
+        self.assertIn("grab_fail:0:3", events)
+
+    def test_simultaneous_grabs_fail_for_both_players(self):
+        state = chat.duel_new()
+        state["p"][1]["x"] = state["p"][0]["x"] + 1
+
+        _, events = chat.duel_round(state, {0: "grab", 1: "grab"})
+
+        self.assertEqual([p["stun"] for p in state["p"]], [3, 3])
+        self.assertIn("grab_fail:0:3", events)
+        self.assertIn("grab_fail:1:3", events)
+
     def test_duplicate_events_and_reconnect_replay_do_not_repeat_turn(self):
         room = Room()
         room.start()
@@ -311,9 +448,9 @@ class DuelStatusTests(unittest.TestCase):
         self.assertIn("Queued to send", self.status())
         self.assertIn("~5s", self.status())
         self.deliver(self.go, "published")
-        self.assertEqual(self.status(), "Round 1: pick your move (1-7)")
+        self.assertEqual(self.status(), "Round 1: pick your move (1-5)")
         self.delayed(self.go)  # stale callback cannot reopen a completed send
-        self.assertEqual(self.status(), "Round 1: pick your move (1-7)")
+        self.assertEqual(self.status(), "Round 1: pick your move (1-5)")
 
     def test_countdown_changes_without_extra_delivery_events(self):
         self.delayed(self.go)
@@ -326,9 +463,9 @@ class DuelStatusTests(unittest.TestCase):
         self.ov.duel["S"]["round"] = 1
         self.ov._duel_begin_round()
         self.delayed(old)
-        self.assertEqual(self.status(), "Round 2: pick your move (1-7)")
+        self.assertEqual(self.status(), "Round 2: pick your move (1-5)")
         self.deliver(old, "failed", text="Old failure")
-        self.assertEqual(self.status(), "Round 2: pick your move (1-7)")
+        self.assertEqual(self.status(), "Round 2: pick your move (1-5)")
         self.ov.duel["retry_button"].config.assert_called_with(state="disabled")
 
     def test_old_success_does_not_clear_current_move_delay(self):
@@ -352,7 +489,7 @@ class DuelStatusTests(unittest.TestCase):
         self.assertEqual(self.status(), "Waiting for the relay connection.")
         self.ov.net.connected = True
         self.ov._duel_tick(time.time())
-        self.assertEqual(self.status(), "Round 1: pick your move (1-7)")
+        self.assertEqual(self.status(), "Round 1: pick your move (1-5)")
 
 
 class NumberGuesserTests(unittest.TestCase):
@@ -369,6 +506,99 @@ class NumberGuesserTests(unittest.TestCase):
         for seconds in (21, 40, 60):
             a._game_tick(a.game["asked_at"] + seconds)
         self.assertEqual(len(room.messages), 1)
+
+
+class NumberGuesserOutcomeTests(unittest.TestCase):
+    def make_overlay(self, with_ui=True):
+        ov = chat.Overlay.__new__(chat.Overlay)
+        ov.game = {"gid": "0123456789ab", "ui": None}
+        ov.root = Mock()
+        if with_ui:
+            ov.game["ui"] = {
+                key: Mock() for key in
+                ("title", "info", "entry", "status", "guess", "skip")
+            }
+        return ov
+
+    def test_wrong_guess_eliminates_player_without_quitting_chat(self):
+        ov = self.make_overlay()
+
+        ov._game_result_ui(True, False, "Player", 4, None)
+
+        text = ov.game["ui"]["title"].config.call_args.kwargs["text"]
+        self.assertIn("out for this round", text)
+        ov.root.after.assert_called_once()
+        self.assertEqual(ov.root.after.call_args.args[0], 5000)
+
+    def test_wrong_result_after_popup_was_closed_does_not_quit_chat(self):
+        ov = self.make_overlay(with_ui=False)
+
+        ov._game_result_ui(True, False, "Player", 4, None)
+
+        ov.root.after.assert_not_called()
+
+    def test_another_players_wrong_guess_does_not_close_my_popup(self):
+        ov = self.make_overlay()
+        title = ov.game["ui"]["title"]
+
+        ov._game_result_ui(False, False, "Player", 4, None)
+
+        title.config.assert_not_called()
+        ov.root.after.assert_not_called()
+
+    def test_host_does_not_disclose_secret_for_a_wrong_guess(self):
+        ov = chat.Overlay.__new__(chat.Overlay)
+        ov.game = {
+            "gid": "0123456789ab", "mine": True, "over": False,
+            "max": 10, "secret": 7, "guessed": {},
+        }
+        ov.net = Mock(uid="host")
+        ov._deliver = Mock()
+        ov.net.send.return_value = {}
+
+        ov._game_msg({
+            "uid": "guest", "name": "Guest",
+            "game": {"op": "guess", "gid": "0123456789ab", "n": 4},
+        })
+
+        result = ov.net.send.call_args.kwargs["extra"]["game"]
+        self.assertFalse(result["ok"])
+        self.assertNotIn("secret", result)
+
+
+class SharedFontFolderTests(unittest.TestCase):
+    def test_saved_font_is_discovered_and_not_duplicated(self):
+        data = b"\x00\x01\x00\x00" + b"\x00" * 20
+        with tempfile.TemporaryDirectory() as folder:
+            path = chat.save_to_font_folder(folder, data, "Demo.ttf")
+
+            self.assertTrue(os.path.isfile(path))
+            found = chat.scan_font_folder(folder, {})
+            digest = chat.font_hash(data)
+            self.assertEqual(found[digest]["n"], "Demo.ttf")
+            self.assertIsNone(chat.save_to_font_folder(folder, data, "Copy.ttf"))
+
+    def test_folder_fonts_are_announced_to_the_room(self):
+        data = b"\x00\x01\x00\x00" + b"\x00" * 20
+        with tempfile.TemporaryDirectory() as folder:
+            chat.save_to_font_folder(folder, data, "Demo.ttf")
+            ov = chat.Overlay.__new__(chat.Overlay)
+            ov.fonts_dir_override = folder
+            ov.font_due = 0
+            ov.font_cache = {}
+            ov.font_mine = {}
+            ov.font_announced = frozenset()
+            ov.font_seen = set()
+            ov.font_wanted = {}
+            ov.font_folder_noted = True
+            ov.net = Mock(join_ok=True)
+            ov.note = Mock()
+
+            ov._fonts_tick(10)
+
+            sent = ov.net.send.call_args.kwargs["extra"]["fontlist"]
+            self.assertEqual(sent[0]["h"], chat.font_hash(data))
+            self.assertEqual(sent[0]["n"], "Demo.ttf")
 
 
 if __name__ == "__main__":

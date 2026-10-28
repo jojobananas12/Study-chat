@@ -56,13 +56,24 @@ Links in messages are clickable (Instagram links open the small reels
 Top bar: the "menu" dropdown holds flip, GIF, reels, settings, updates and
   Disconnect (leaves the room and closes the program).
 Commands: /disconnect (or /quit), /getfonts (install the free fonts your friends use),
+  /guess (start a shared number-guessing game),
   /reels [link] (small Instagram window; needs Chrome, Chromium,
   Edge or Brave, or pywebview), /reelgif (send a GIF of the reel; same as
   the "gif" button, "/reelgif area" picks the screen area again),
   /duel (challenge the room to a tiny turn-based fighting game),
+  /duel solo (test it alone: you control both fighters),
   /who (who's online), /update (check for a new version),
   /version, /settings, /img, /quit. The chat checks GitHub for a newer
   version when it starts; set STUDYCHAT_NO_UPDATE=1 to turn that off.
+
+Shared fonts:
+  Fonts in ~/StudyChatFonts are offered to people in the room. When you accept
+  a font from someone, it is saved in your folder and can be shared onward.
+  Use "get fonts" to accept offers; only accept fonts from people you trust.
+
+Number guesser:
+  Use /guess or the menu to start a shared round. Everyone else gets one
+  guess; a wrong guess ends that player's turn without closing their chat.
 
 Images:
   - Press Ctrl+V in the text box to send an image from your clipboard
@@ -120,7 +131,7 @@ except Exception:
 # ------------------------------------------------------------------ version
 # Bump VERSION whenever you publish a new studychat.py to GitHub. Everyone
 # running an older version is told, and can update with one click.
-VERSION = "1.9"
+VERSION = "1.13"
 UPDATE_REPO = "jojobananas12/Study-chat"     # github.com/<this>
 CHECK_UPDATES = os.environ.get("STUDYCHAT_NO_UPDATE") != "1"
 
@@ -821,43 +832,54 @@ def shrink_gif(data, limit):
 # number of turns. The same picks always give the same fight on every laptop,
 # so players only send their picks (one small message per pick). Nothing in
 # here touches Tk or the network.
-DUEL_W = 10                  # arena is spaces 0..DUEL_W
+DUEL_W = 10                  # the arena is a row of tiles 0..DUEL_W
 DUEL_HP = 5
 DUEL_START = (3, 7)
 DUEL_MAX_ROUNDS = 25         # turns; then whoever has more HP wins
 DUEL_SUB = 8                 # animation frames drawn per turn
 
-# Rules: turns = how many turns it takes, reach = how many spaces away it can
+# Rules: turns = how many turns it takes, reach = how many tiles away it can
 # hit, dmg = damage. The su/act/rec/steps numbers are only for the drawing.
 DUEL_MOVES = {
-    "light":   dict(kind="strike", turns=1, reach=1, dmg=1,
+    "jab":     dict(kind="strike", turns=1, reach=1, dmg=1,
                     su=3, act=2, rec=4,
-                    help="1 turn, reach 1, 1 damage. Beats grab, and "
-                         "cancels a heavy wind-up."),
+                    help="1 turn, hits the 1 tile in front, 1 damage. Beats "
+                         "grab, and cancels a heavy wind-up. If it's blocked "
+                         "you lose your next turn."),
     "heavy":   dict(kind="strike", turns=2, reach=2, dmg=2,
                     su=7, act=3, rec=8,
-                    help="2 turns (wind up, then strike), reach 2, 2 damage. "
-                         "A hit on the wind-up cancels it. If it's blocked "
-                         "you lose your next turn."),
+                    help="2 turns (wind up, then strike), hits the 2 tiles in "
+                         "front, 2 damage. A hit on the wind-up cancels it. "
+                         "If it's blocked you lose your next turn."),
     "grab":    dict(kind="throw", turns=1, reach=1, dmg=0,
                     su=2, act=2, rec=3,
-                    help="1 turn, reach 1, no damage. Beats block. If it "
-                         "lands they lose their next turn, so you act "
-                         "first. Loses to light and heavy."),
+                    help="1 turn, hits the 1 tile in front, no damage. Beats "
+                         "block. If it lands, they lose 2 turns. If it fails, "
+                         "you lose 3 turns. Loses to jab and heavy."),
     "block":   dict(kind="guard", turns=1, su=1, act=7, rec=3,
-                    help="1 turn. Stops light and heavy. Loses to grab."),
+                    help="1 turn, covers your own tile. Stops jab and heavy, "
+                         "and then the attacker loses their next turn. Loses "
+                         "to grab. If nothing was blocked you lose your next "
+                         "turn."),
     "advance": dict(kind="walk", turns=1, dir=1, steps=2, su=0, act=0, rec=1,
-                    help="1 turn, step 1 space closer."),
+                    help="1 turn, step 1 tile forward."),
+    "dash":    dict(kind="walk", turns=2, dir=1, distance=3, first=2,
+                    steps=4, su=0, act=0, rec=1,
+                    help="2 turns: move 2 tiles forward now and 1 more next turn."),
     "retreat": dict(kind="walk", turns=1, dir=-1, steps=2, su=0, act=0, rec=1,
-                    help="1 turn, step 1 space away."),
+                    help="1 turn, step 1 tile back."),
+    "dash_back": dict(kind="walk", turns=2, dir=-1, distance=3, first=2,
+                      steps=4, su=0, act=0, rec=1,
+                      help="2 turns: move 2 tiles back now and 1 more next turn."),
     "wait":    dict(kind="idle", turns=1, su=0, act=0, rec=3,
                     help="1 turn, do nothing."),
 }
-DUEL_ORDER = ("light", "heavy", "grab", "block", "advance", "retreat", "wait")
+DUEL_ORDER = ("jab", "heavy", "grab", "block", "wait")
+DUEL_MOVE_CHOICES = ("advance", "dash")
 
 # What each fighter does on one turn. "wind" and "strike" are the two halves
 # of a heavy attack; "stunned" is a turn lost.
-_ATTACKS = {"light": ("light", 1, 1), "strike": ("heavy", 2, 2),
+_ATTACKS = {"jab": ("jab", 1, 1), "strike": ("heavy", 2, 2),
             "grab": ("grab", 1, 0)}          # act: (art move, reach, damage)
 
 
@@ -884,6 +906,51 @@ def duel_need(S):
     """Which fighters must pick a move this turn. Anyone winding up or
     stunned has no choice, so they send nothing."""
     return [i for i in (0, 1) if duel_free(S["p"][i])]
+
+
+def duel_turn_lead(S, i):
+    """Positive means fighter i has fewer committed/lost turns remaining."""
+    def unavailable(fi):
+        return fi["stun"] + (
+            1 if fi["move"] in ("heavy", "dash", "dash_back") else 0)
+    return unavailable(S["p"][1 - i]) - unavailable(S["p"][i])
+
+
+def duel_frame_lead(S, i):
+    """Turn advantage expressed in the duel's animation frames."""
+    return duel_turn_lead(S, i) * DUEL_SUB
+
+
+def duel_movement_action(direction, action):
+    """Resolve the selected relative direction and movement type."""
+    if direction not in ("forward", "back"):
+        raise ValueError("movement direction must be forward or back")
+    if action not in DUEL_MOVE_CHOICES:
+        raise ValueError("movement type must be advance or dash")
+    if direction == "forward":
+        return action
+    return "retreat" if action == "advance" else "dash_back"
+
+
+def duel_move_tiles(m, x, f):
+    """The tiles a move affects for a fighter on tile x facing f (+1 means
+    the right). Returns (tiles, kind) for the hover highlight."""
+    d = DUEL_MOVES.get(m)
+    if not d:
+        return [], None
+    k = d["kind"]
+    if k == "walk":
+        distance = d.get("distance", 1)
+        tiles = [x + d["dir"] * f * n for n in range(1, distance + 1)]
+        kind = "move"
+    elif k in ("strike", "throw"):
+        tiles = [x + f * j for j in range(1, d["reach"] + 1)]
+        kind = "attack" if k == "strike" else "grab"
+    elif k == "guard":
+        tiles, kind = [x], "guard"
+    else:
+        return [], None
+    return [t for t in tiles if 0 <= t <= DUEL_W], kind
 
 
 def _art_t(fi):
@@ -925,6 +992,8 @@ def duel_round(S, choices):
             acts[i] = "stunned"
         elif fi["move"] == "heavy":
             acts[i] = "strike"                   # second half of the heavy
+        elif fi["move"] in ("dash", "dash_back"):
+            acts[i] = "dash_follow"
         else:
             m = choices.get(i)
             m = m if m in DUEL_MOVES else "wait"
@@ -934,8 +1003,13 @@ def duel_round(S, choices):
     # ---- 1. walking (a step that would make them touch is cancelled)
     step = [0, 0]
     for i in (0, 1):
-        if acts[i] in ("advance", "retreat"):
-            step[i] = DUEL_MOVES[acts[i]]["dir"] * P[i]["f"]
+        if acts[i] in ("advance", "dash", "retreat", "dash_back"):
+            move = DUEL_MOVES[acts[i]]
+            distance = move.get("first", move.get("distance", 1))
+            step[i] = move["dir"] * P[i]["f"] * distance
+        elif acts[i] == "dash_follow":
+            move = DUEL_MOVES[P[i]["move"]]
+            step[i] = move["dir"] * P[i]["f"]
     nx = [min(DUEL_W, max(0, P[i]["x"] + step[i])) for i in (0, 1)]
     if nx[1] - nx[0] < 1:
         for i in (0, 1):
@@ -948,7 +1022,9 @@ def duel_round(S, choices):
     hurt = [0, 0]                                # damage taken
     stun = [0, 0]                                # turns lost from now on
     cut = [False, False]                         # move cancelled
+    grabbed = [False, False]                     # successful grab by fighter
     seen = [None, None]                          # animation frame it shows on
+    blocked = [False, False]                     # a block that stopped a hit
     for a in (0, 1):
         if not land[a]:
             continue
@@ -958,26 +1034,36 @@ def duel_round(S, choices):
                      DUEL_MOVES["heavy"]["su"] if act == "strike" else 0,
                      _anim_total(_ATTACKS[act][0]))
         if act == "grab":
-            if land[d] and acts[d] != "grab":
-                continue                         # an attack beats a grab
+            if acts[d] in ("jab", "wind", "strike"):
+                continue                         # attacks beat a grab
             if land[d]:
                 if a == 0:
                     ev.append((k, "tech"))       # both grabbed: nothing
                 continue
-            stun[d] = max(stun[d], 1)            # frame advantage
+            grabbed[a] = True
+            stun[d] = max(stun[d], 2)
             cut[d] = True
             seen[d] = k
             ev.append((k, "grab:%d" % d))
         elif acts[d] == "block":
+            blocked[d] = True
             ev.append((k, "blocked:%d" % d))
-            if act == "strike":
-                stun[a] = max(stun[a], 1)        # a blocked heavy: you stall
-                seen[a] = k
+            stun[a] = max(stun[a], 1)            # a blocked attack: you stall
+            seen[a] = k
         else:
             hurt[d] += _ATTACKS[act][2]
             cut[d] = True
             seen[d] = k
             ev.append((k, "hit:%d:%s" % (d, _ATTACKS[act][0])))
+    for i in (0, 1):                             # a block that stops nothing
+        if acts[i] == "block" and not blocked[i] and not stun[i]:
+            stun[i] = 1                              # costs the next turn
+            ev.append((DUEL_SUB, "whiff:%d" % i))
+    for i in (0, 1):
+        if acts[i] == "grab" and not grabbed[i]:
+            penalty = 4 if acts[1 - i] == "jab" else 3
+            stun[i] = max(stun[i], penalty)
+            ev.append((DUEL_SUB, f"grab_fail:{i}:{penalty}"))
     # ---- 3. apply it
     S["round"] += 1
     for i in (0, 1):
@@ -989,6 +1075,8 @@ def duel_round(S, choices):
         fi["stun"] = max(fi["stun"], stun[i])
         if acts[i] == "wind" and not cut[i]:
             fi["move"], fi["t"] = "heavy", 1     # strikes next turn
+        elif acts[i] in ("dash", "dash_back") and not cut[i]:
+            fi["move"], fi["t"] = acts[i], 1     # one more tile next turn
         else:
             fi["move"], fi["t"] = None, 0
     a, b = P[0]["hp"], P[1]["hp"]
@@ -1017,6 +1105,8 @@ def _turn_frame(k, st, acts, hurt, seen, nx, P, ev):
         elif a_ == "strike":
             am, lo, hi = "heavy", DUEL_MOVES["heavy"]["su"], \
                 _anim_total("heavy")
+        elif a_ == "dash_follow":
+            am, lo, hi = st[i]["move"], 0, _anim_total(st[i]["move"])
         elif a_ in DUEL_MOVES and a_ != "wait":
             am, lo, hi = a_, 0, _anim_total(a_)
         else:
@@ -1223,8 +1313,8 @@ def _pose(p, phase):
         sw = 3 if (p["t"] % 2) else -3
         q.update(ff=5 + sw, bf=-4 - sw, ffy=-1 if sw > 0 else 0,
                  bfy=-1 if sw < 0 else 0, drop=0,
-                 lean=2 if m == "advance" else -1)
-    elif m == "light":
+                 lean=2 if m in ("advance", "dash") else -1)
+    elif m == "jab":
         if ph == "su":
             hx = _lerp(8, 1, u)
             q.update(lean=_lerp(1, -2, u), ff=_lerp(5, 3, u), hand=(hx, -17),
@@ -1462,6 +1552,32 @@ def _hud(fr, goal):
             for dy in range(-j, j + 1):
                 pts.add((x + d * (18 + 5 - j), 38 + dy))
         out += _runs(pts, DUEL_COLS[w])
+    return out
+
+
+DUEL_TILE_COLS = ("#2c2542", "#1f1a33")      # the two chessboard shades
+DUEL_HL = {"attack": "#e8453c", "grab": "#b06bff", "move": "#4a8fe0",
+           "guard": "#3fbf6a"}
+
+
+def duel_tile_rects(hl=None):
+    """The row of tiles under the fighters. hl = (tiles, kind) lights some
+    of them up (hovering over a move)."""
+    on = {}
+    if hl:
+        for t in hl[0]:
+            on[t] = hl[1]
+    out = []
+    for t in range(DUEL_W + 1):
+        x = DUEL_MX + t * DUEL_U - DUEL_U // 2
+        kind = on.get(t)
+        if kind:
+            col = DUEL_HL[kind]
+            out.append((x, DUEL_GY + 1, DUEL_U - 1, 8, col))
+            out.append((x, DUEL_GY - 3, DUEL_U - 1, 3, col))   # a bar above
+        else:
+            out.append((x, DUEL_GY + 1, DUEL_U - 1, 8,
+                        DUEL_TILE_COLS[t % 2]))
     return out
 
 
@@ -1716,6 +1832,11 @@ class Net:
         self.inbox.put(msg)
 
 
+def relay_keepalive_due(now, last_keepalive, last_published, interval):
+    """Only send a presence ping after a full interval without any post."""
+    return now - max(last_keepalive, last_published) > interval
+
+
 class RelayNet:
     """Online mode: messages go through a free public relay (ntfy.sh) over
     HTTPS, so it works on school wifi that stops laptops from seeing each
@@ -1731,6 +1852,7 @@ class RelayNet:
         self.connected = False
         self.uid = uuid.uuid4().hex
         self.closed = False
+        self.last_published_at = time.time()
         # The free relay allows only a few posts per minute for everyone on
         # the same internet address, so keep background chatter rare.
         self.ping_every = max(ONLINE_PING_EVERY, 180)
@@ -1863,6 +1985,7 @@ class RelayNet:
                                      "Message": meta})
                     try:
                         self._open(req, 60).read()
+                        self.last_published_at = time.time()
                         self.cool_n = 0
                         if msg.get("type") == "join":
                             self.join_ok = True
@@ -3193,6 +3316,8 @@ class Overlay:
                           else "Cancel the duel", command=self.duel_quit_cmd)
         else:
             m.add_command(label="Duel...", command=self.duel_cmd)
+            m.add_command(label="Duel solo (testing)",
+                          command=self.duel_solo_cmd)
         m.add_command(label="Flip everyone's chat", command=self.flip_cmd)
         m.add_command(label="Send GIF of the reel", command=self.clip_reel)
         m.add_command(label="Pick the reel area again",
@@ -3883,6 +4008,9 @@ class Overlay:
         if text == "/duel":
             self.duel_cmd()
             return
+        if text in ("/duel solo", "/solo"):
+            self.duel_solo_cmd()
+            return
         if text == "/reels" or text.startswith("/reels "):
             self.open_reels(text[6:])
             return
@@ -4081,10 +4209,9 @@ class Overlay:
 
     # ---- number guesser
     # One person picks a secret number. Everyone else gets a popup and one
-    # guess, and a wrong guess closes that person's chat. The secret never
+    # guess, and a wrong guess ends that person's turn. The secret never
     # leaves the host's computer: guesses go to the host, who answers each
-    # one. Nobody is ever disconnected unless the host answers "wrong" to a
-    # guess that person made themselves, in a game they were shown.
+    # one. A wrong result ends the guesser's turn, but never exits their app.
     GAME_MAX = 1_000_000
     GAME_SECONDS = 900
 
@@ -4136,7 +4263,8 @@ class Overlay:
 
         label("Pick a secret number", font=F(2, True))
         label("Everyone else gets a popup and one guess.\n"
-              "A wrong guess disconnects them.", fg=MUTED)
+              "A wrong guess ends their turn, but keeps chat connected.",
+              fg=MUTED)
         label("Your number:")
         secret = tk.Entry(win, show="*", font=F())   # hidden: no peeking
         secret.pack(fill="x", padx=14)
@@ -4268,8 +4396,8 @@ class Overlay:
         self._deliver({"type": "sys", "name": "", "text":
                        f"{gname} guessed {n} and got it! The number was "
                        f"{secret}." if ok else
-                       f"{gname} guessed {n}: wrong! {gname} gets "
-                       "disconnected."})
+                       f"{gname} guessed {n}: wrong! {gname} is out for "
+                       "this round."})
 
     def _game_popup(self):
         """The window that appears for everyone except the host."""
@@ -4284,8 +4412,8 @@ class Overlay:
         title.pack(padx=20, pady=(16, 4))
         info = tk.Label(win, bg=BG, fg=MUTED, font=F(), justify="center",
                         text=f"Pick a whole number from 1 to {G['max']}.\n"
-                             "You only get one guess. Guess wrong and the "
-                             "chat disconnects you.")
+                             "You only get one guess. A wrong guess ends "
+                             "your turn, but keeps chat connected.")
         info.pack(padx=20)
         entry = tk.Entry(win, font=F(2), justify="center", width=10)
         entry.pack(pady=10)
@@ -4342,15 +4470,13 @@ class Overlay:
         G = self.game
         ui = G.get("ui") if G else None
         if not ui:
-            if mine and not ok:              # popup gone, but still wrong
-                self.root.after(2500, self.disconnect)
             return
         if ok:
             text = (f"Awesome! You got it!\nThe number was {n}." if mine else
                     f"{gname} got it!\nThe number was {secret}.")
             color = "#7be08a"
         elif mine:
-            text = f"Wrong! The number wasn't {n}.\nDisconnecting..."
+            text = f"Wrong! The number wasn't {n}.\nYou're out for this round."
             color = "#ff7a7a"
         else:
             return                           # someone else missed: keep going
@@ -4360,11 +4486,8 @@ class Overlay:
             except Exception:
                 pass
         ui["title"].config(text=text, fg=color)
-        if mine and not ok:
-            self.root.after(2500, self.disconnect)
-        else:
-            gid = G["gid"]
-            self.root.after(5000, lambda: self._game_close_window(gid))
+        gid = G["gid"]
+        self.root.after(5000, lambda: self._game_close_window(gid))
 
     def _game_close_window(self, gid=None):
         G = self.game
@@ -4462,6 +4585,19 @@ class Overlay:
         self.note("you challenged the room to a duel. Waiting for someone "
                   "to accept (type /duel again to cancel)")
 
+    def duel_solo_cmd(self):
+        """Testing: one person plays both fighters. Nothing is sent."""
+        D = self.duel
+        if D and not D["over"]:
+            self.note("finish or close the current duel first")
+            return
+        gid = uuid.uuid4().hex[:12]
+        self.duel = self._duel_blank(gid, self.net.uid, self.net.name, True)
+        self.duel["solo"] = True
+        self._duel_start([self.net.uid, "solo"],
+                         [self.net.name + " 1", self.net.name + " 2"])
+        self.note("solo duel: you pick for both fighters")
+
     def duel_quit_cmd(self):
         D = self.duel
         if not D or D["over"]:
@@ -4472,6 +4608,8 @@ class Overlay:
             self.duel_cmd()
 
     def _duel_send(self, d):
+        if self.duel.get("solo"):
+            return                           # solo: nobody to tell
         d = dict(d)
         d["gid"] = self.duel["gid"]
         self.net.send("", kind="ping", extra={"duel": d})
@@ -4665,10 +4803,10 @@ class Overlay:
         status = tk.Label(win, text="", bg=BG, fg=FG, font=F(1, True))
         status.pack()
         info = tk.Label(win, text="", bg=BG, fg=MUTED, font=F(),
-                        wraplength=w, justify="center")
+                        wraplength=w, justify="center", height=3)
         info.pack(padx=10)
         row = tk.Frame(win, bg=BG)
-        row.pack(pady=8)
+        row.pack(pady=(8, 2))
         btns = {}
         for n, m in enumerate(DUEL_ORDER, 1):
             b = tk.Button(row, text=f"{n} {m}", width=8,
@@ -4678,16 +4816,54 @@ class Overlay:
             b.bind("<Leave>", lambda e: self._duel_hint(None))
             btns[m] = b
             win.bind(str(n), lambda e, m=m: self._duel_pick(m))
-        helpl = tk.Label(win, text="", bg=BG, fg=MUTED, font=F(-1))
+        move_row = tk.Frame(win, bg=BG)
+        move_row.pack(pady=(2, 8))
+        tk.Label(move_row, text="Direction (facing):", bg=BG, fg=MUTED,
+                 font=F(-1)).pack(side="left", padx=(0, 3))
+        direction_buttons = {}
+        for label, direction in (("Forward", "forward"), ("Back", "back")):
+            button = tk.Button(
+                move_row, text=label, width=8,
+                command=lambda direction=direction:
+                self._duel_direction(direction))
+            button.pack(side="left", padx=2)
+            direction_buttons[direction] = button
+            btns["direction_" + direction] = button
+            win.bind("<Right>" if direction == "forward" else "<Left>",
+                     lambda e, direction=direction:
+                     self._duel_direction(direction))
+        movement_buttons = {}
+        for label, action, key in (("Advance", "advance", "6"),
+                                   ("Dash", "dash", "7")):
+            button = tk.Button(
+                move_row, text=label, width=8,
+                command=lambda action=action: self._duel_move(action))
+            button.pack(side="left", padx=2)
+            button.bind("<Enter>", lambda e, action=action:
+                        self._duel_hint_move(action))
+            button.bind("<Leave>", lambda e: self._duel_hint(None))
+            btns["move_" + action] = button
+            movement_buttons[action] = button
+            win.bind(key, lambda e, action=action:
+                     self._duel_move(action))
+        # fixed room for the hint, so a long one can't stretch the window
+        helpl = tk.Label(win, text="", bg=BG, fg=MUTED, font=F(-1),
+                         wraplength=w, justify="center", height=3)
         helpl.pack(pady=(0, 10))
         win.protocol("WM_DELETE_WINDOW", self._duel_close_window)
         D["win"] = win
-        D["ui"] = {"cv": cv, "status": status, "info": info, "btns": btns,
-                   "help": helpl}
+        D["ui"] = {"cv": cv, "status": status, "info": info,
+                   "btns": btns, "direction_buttons": direction_buttons,
+                   "movement_buttons": movement_buttons, "help": helpl}
         D["fx"] = DuelFx(int(D["gid"], 16) & 0xFFFF)
         D["phase"], D["stage"], D["bg_off"] = 0, None, (0, 0)
         D["frame"], D["goal"] = duel_frame(D["S"]), None
         self._center(win)
+        try:                                 # and the window never resizes
+            win.update_idletasks()
+            win.geometry(f"{win.winfo_reqwidth()}x{win.winfo_reqheight()}")
+        except Exception:
+            pass
         self._duel_draw(D["frame"])
         self.root.after(130, self._duel_idle)
 
@@ -4711,15 +4887,74 @@ class Overlay:
         if not ui:
             return
         ui["help"].config(text=f"{m}: {DUEL_MOVES[m]['help']}" if m else "")
+        D["hl"] = None
+        if m and D.get("S"):
+            i = D["me"]
+            if D.get("solo"):                # the fighter who picks next
+                todo = [j for j in duel_need(D["S"])
+                        if (D["r"], j) not in D["picks"]]
+                i = todo[0] if todo else i
+            p = D["S"]["p"][i]
+            D["hl"] = duel_move_tiles(m, p["x"], p["f"])
+        if D.get("frame") and not D.get("anim"):
+            self._duel_draw(D["frame"])
+
+    def _duel_picker(self):
+        D = self.duel
+        if not D or D["state"] != "playing" or D["over"] or D["anim"]:
+            return None
+        if D.get("solo"):
+            todo = [i for i in duel_need(D["S"])
+                    if (D["r"], i) not in D["picks"]]
+            return todo[0] if todo else None
+        if D["pick"] is None and D["me"] in duel_need(D["S"]):
+            return D["me"]
+        return None
+
+    def _duel_direction(self, direction):
+        D = self.duel
+        if direction not in ("forward", "back") or self._duel_picker() is None:
+            return
+        self._duel_set_move_direction(direction)
+        self._duel_buttons(True)
+
+    def _duel_set_move_direction(self, direction):
+        D = self.duel
+        D["move_dir"] = direction
+        ui = D.get("ui")
+        if ui and ui.get("movement_buttons"):
+            ui["movement_buttons"]["advance"].config(
+                text="Retreat" if direction == "back" else "Advance")
+
+    def _duel_move(self, action):
+        D = self.duel
+        if not D or self._duel_picker() is None or D.get("move_dir") is None:
+            return
+        self._duel_pick(duel_movement_action(D["move_dir"], action))
+
+    def _duel_hint_move(self, action):
+        D = self.duel
+        if not D or D.get("move_dir") is None:
+            self._duel_hint(None)
+            return
+        self._duel_hint(duel_movement_action(D["move_dir"], action))
 
     def _duel_buttons(self, on):
         D = self.duel
         ui = D.get("ui") if D else None
         if not ui:
             return
-        for b in ui["btns"].values():
+        for name, b in ui["btns"].items():
+            enabled = on and (not name.startswith("move_")
+                              or D.get("move_dir") is not None)
             try:
-                b.config(state="normal" if on else "disabled")
+                b.config(state="normal" if enabled else "disabled")
+            except Exception:
+                pass
+        for direction, button in ui.get("direction_buttons", {}).items():
+            try:
+                button.config(relief=(
+                    "sunken" if D.get("move_dir") == direction else "raised"))
             except Exception:
                 pass
 
@@ -4727,6 +4962,8 @@ class Overlay:
         D = self.duel
         if not D:
             return
+        if D.get("solo"):
+            D["over"] = True                 # no forfeit question when alone
         if D["state"] == "playing" and not D["over"]:
             self._duel_forfeit()
             return
@@ -4742,6 +4979,9 @@ class Overlay:
 
     def _duel_forfeit(self):
         D = self.duel
+        if D.get("solo"):
+            self._duel_close_window()
+            return
         from tkinter import messagebox
         self.busy = True
         try:
@@ -4780,7 +5020,9 @@ class Overlay:
             cv.move("bg", dx * sc, dy * sc)
             D["bg_off"] = (ox, oy)
         cv.delete("fg")
-        for (x, y, w, h, c) in duel_fg_rects(fr, fx, D["phase"], D["goal"]):
+        rects = duel_tile_rects(D.get("hl")) + duel_fg_rects(
+            fr, fx, D["phase"], D["goal"])
+        for (x, y, w, h, c) in rects:
             cv.create_rectangle((x + ox) * sc, (y + oy) * sc,
                                 (x + ox + w) * sc, (y + oy + h) * sc,
                                 fill=c, outline="", tags="fg")
@@ -4792,6 +5034,23 @@ class Overlay:
                            text=f"{D['names'][i]}  {max(0, p['hp'])}/{DUEL_HP}",
                            fill=DUEL_COLS[i], font=font, tags="fg",
                            anchor="nw" if i == 0 else "ne")
+        perspective = 0 if D.get("solo") else D["me"]
+        advantage = duel_frame_lead(D["S"], perspective)
+        if advantage > 0:
+            lead_text = f"+{advantage} frames"
+            lead_color = "#7be08a"
+        elif advantage < 0:
+            lead_text = f"{advantage} frames"
+            lead_color = "#ff7a7a"
+        else:
+            lead_text, lead_color = "0 frames", MUTED
+        if D.get("solo") and advantage:
+            lead_text = f"{D['names'][perspective]} {lead_text}"
+        cv.create_text((DUEL_LW // 2 + ox) * sc, (4 + oy) * sc,
+                       text=lead_text, fill=lead_color, font=font,
+                       tags="fg", anchor="n")
+        for i in (0, 1):
+            p = fr["p"][i]
             label = ("K.O." if p["ko"] else p["move"]
                      or ("stunned" if p["stun"] else "ready")).upper()
             cx = DUEL_MX + p["x"] * DUEL_U
@@ -4805,26 +5064,49 @@ class Overlay:
         S = D["S"]
         D["r"] = S["round"] + 1
         D["pick"], D["anim"], D["out"] = None, False, None
+        self._duel_set_move_direction(None)
+        D["hl"] = None
         D["resends"], D["next_resend"] = 0, time.time() + self.DUEL_RESEND[0]
         for key in [k for k in D["picks"] if k[0] < D["r"]]:
             D["picks"].pop(key, None)
         need = duel_need(S)
         ui = D.get("ui")
         me = D["me"]
-        if ui:
+        if ui and D.get("solo"):
+            n = D["r"]
+            self._duel_buttons(bool(need))
+            if len(need) == 2:
+                text = (f"Turn {n}: pick for {D['names'][0]}, "
+                        f"then for {D['names'][1]}")
+            elif need:
+                text = f"Turn {n}: pick for {D['names'][need[0]]} only"
+            else:
+                text = f"Turn {n}: ..."
+            ui["status"].config(text=text,
+                                fg=DUEL_COLS[need[0]] if need else MUTED)
+            ui["info"].config(text=D["last"])
+        elif ui:
             mine = me in need
             self._duel_buttons(mine)
             P, other = S["p"], D["names"][1 - me]
             n = D["r"]
             if mine and len(need) == 2:
-                text, col = f"Turn {n}: pick your move (1-7)", FG
+                text, col = (f"Turn {n}: pick your move "
+                             f"(1-{len(DUEL_ORDER)})", FG)
             elif mine:
-                why = ("is winding up a heavy attack, and it lands this turn"
-                       if P[1 - me]["move"] == "heavy" else
-                       "lost this turn")
-                text, col = f"Turn {n}: {other} {why}. Your move!", "#7be08a"
+                if P[1 - me]["move"] == "heavy":
+                    text = (f"Turn {n}: {other} is winding up a heavy attack, "
+                            "and it lands this turn. Your move!")
+                elif P[1 - me]["move"] in ("dash", "dash_back"):
+                    text = f"Turn {n}: {other} is finishing a dash. Your move!"
+                else:
+                    text = f"Turn {n}: {other} lost this turn. Your move!"
+                text, col = text, "#7be08a"
             elif P[me]["move"] == "heavy":
                 text, col = (f"Turn {n}: your heavy attack strikes now. "
+                             f"{other} is choosing...", MUTED)
+            elif P[me]["move"] in ("dash", "dash_back"):
+                text, col = (f"Turn {n}: your dash finishes now. "
                              f"{other} is choosing...", MUTED)
             elif need:
                 text, col = (f"Turn {n}: you lost this turn. {other} is "
@@ -4841,6 +5123,21 @@ class Overlay:
                 or D["pick"] is not None or move not in DUEL_MOVES):
             return
         S, me, r = D["S"], D["me"], D["r"]
+        if D.get("solo"):                    # fill in whoever still needs one
+            todo = [i for i in duel_need(S) if (r, i) not in D["picks"]]
+            if not todo:
+                return
+            D["picks"][(r, todo[0])] = move
+            self._duel_set_move_direction(None)
+            remaining = [i for i in todo[1:]
+                         if (r, i) not in D["picks"]]
+            if remaining and D.get("ui"):
+                D["ui"]["status"].config(
+                    text=f"Turn {r}: now pick for {D['names'][remaining[0]]}",
+                    fg=DUEL_COLS[remaining[0]])
+            self._duel_buttons(bool(remaining))
+            self._duel_progress()
+            return
         if me not in duel_need(S):
             return                           # no choice this turn
         D["pick"] = move
@@ -4873,6 +5170,7 @@ class Overlay:
                 return
             choices[i] = m
         D["anim"] = True
+        D["hl"] = None
         labels = []
         for i in (0, 1):
             if i in choices:
@@ -4880,6 +5178,8 @@ class Overlay:
                                             if choices[i] == "heavy" else ""))
             elif S["p"][i]["stun"] > 0:
                 labels.append("lost turn")
+            elif S["p"][i]["move"] in ("dash", "dash_back"):
+                labels.append("dash follow-through")
             else:
                 labels.append("heavy strike")
         frames, ev = duel_round(S, choices)
@@ -4897,12 +5197,21 @@ class Overlay:
             if bits[0] == "hit":
                 out.append(f"{n[int(bits[1])]} got hit by {bits[2]}")
             elif bits[0] == "blocked":
-                out.append(f"{n[int(bits[1])]} blocked it")
-            elif bits[0] == "grab":
-                out.append(f"{n[int(bits[1])]} was grabbed and loses the "
+                d = int(bits[1])
+                out.append(f"{n[d]} blocked it, so {n[1 - d]} loses the "
                            "next turn")
+            elif bits[0] == "grab":
+                out.append(f"{n[int(bits[1])]} was grabbed and loses "
+                           "2 turns")
+            elif bits[0] == "grab_fail":
+                penalty = bits[2]
+                out.append(f"{n[int(bits[1])]} missed the grab and loses "
+                           f"{penalty} turns")
+            elif bits[0] == "whiff":
+                out.append(f"{n[int(bits[1])]} blocked nothing and loses "
+                           "the next turn")
             elif bits[0] == "tech":
-                out.append("both grabbed, nothing happens")
+                out.append("both grabs failed")
         return "   ".join(parts) + ("  -  " + ", ".join(out) if out else
                                     "  -  nothing connected")
 
@@ -4941,17 +5250,21 @@ class Overlay:
         n = D["names"]
         if winner == -1:
             text = "Draw!"
+        elif D.get("solo"):
+            text = f"{n[winner]} wins!"
         elif winner == D["me"]:
             text = "You win!" + (" (they forfeited)" if why == "forfeit" else "")
         else:
             text = "You lose." + (" (you forfeited)" if why == "forfeit" else "")
         ui = D.get("ui")
         if ui:
-            ui["status"].config(text=text, fg="#7be08a" if winner == D["me"]
-                                else "#ff7a7a" if winner != -1 else FG)
+            ui["status"].config(
+                text=text, fg=(DUEL_COLS[winner] if D.get("solo") and winner != -1
+                               else "#7be08a" if winner == D["me"]
+                               else "#ff7a7a" if winner != -1 else FG))
             ui["info"].config(text=D["last"] + "\nClose this window when done.")
             self._duel_buttons(False)
-        if D["mine"]:                                # the host tells the room
+        if D["mine"] and not D.get("solo"):          # the host tells the room
             hp = [p["hp"] for p in D["S"]["p"]] if D["S"] else [0, 0]
             if winner == -1:
                 msg = f"Duel: {n[0]} and {n[1]} drew."
@@ -4993,7 +5306,7 @@ class Overlay:
                 self._duel_over(f"{D['host']} didn't answer, so the duel "
                                 "was dropped")
         elif D["state"] == "playing" and not D["anim"] \
-                and now > D["next_resend"]:
+                and not D.get("solo") and now > D["next_resend"]:
             # Stuck waiting. Only speak once our own pick is in (or we
             # had none to make): if they are waiting on US, nothing was lost.
             me = D["me"]
@@ -5353,7 +5666,14 @@ class Overlay:
                 except Exception:
                     log("background job failed: " + traceback.format_exc())
             # tell others we're still here, and notice when someone stops
-            if now - self.last_ping > self.net.ping_every:
+            if online:
+                due = relay_keepalive_due(
+                    now, self.last_ping,
+                    getattr(self.net, "last_published_at", self.last_ping),
+                    self.net.ping_every)
+            else:
+                due = now - self.last_ping > self.net.ping_every
+            if due:
                 self.last_ping = now
                 self.net.send("", kind="ping")
             for pname in self.presence.expired(now, 3 * self.net.ping_every):
