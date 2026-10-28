@@ -246,6 +246,22 @@ class OutboxTests(unittest.TestCase):
                 self.assertEqual(chat.RELAY_REFILL_SECONDS, 7)
 
 
+class RelayKeepaliveTests(unittest.TestCase):
+    def test_recent_outgoing_posts_replace_redundant_keepalive(self):
+        interval = 180
+        last_keepalive = 100
+        last_published = 279
+
+        self.assertFalse(chat.relay_keepalive_due(
+            280, last_keepalive, last_published, interval))
+        self.assertTrue(chat.relay_keepalive_due(
+            460, last_keepalive, last_published, interval))
+
+    def test_idle_room_still_sends_keepalive_after_interval(self):
+        self.assertTrue(chat.relay_keepalive_due(
+            281, 100, 100, 180))
+
+
 class RelayHTTPTests(unittest.TestCase):
     def test_shared_server_budget_backoffs_without_changing_match(self):
         room = Room(8)
