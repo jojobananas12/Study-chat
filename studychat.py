@@ -79,6 +79,7 @@ import argparse
 import base64
 import email.utils
 import hashlib
+import struct
 import io
 import json
 import os
@@ -158,6 +159,8 @@ POPUP_LINES = 5          # most messages in the popup: the new one + 4 earlier
 MAX_HISTORY = 300        # messages kept in the chat
 DEFAULT_NAME = ""        # pre-filled in the "Your name" box
 DEFAULT_ROOM = "study"   # pre-filled in the "Room name" box
+FONT_SYNC = 1            # 1 = share the fonts folder with the room, 0 = don't
+FONT_FOLDER = os.path.join(os.path.expanduser("~"), "StudyChatFonts")
 
 # --- Images
 THUMB_W, THUMB_H = 280, 180
@@ -209,6 +212,9 @@ SPEC = [
      "int", 0, 1),
     ("Behavior", "DEFAULT_NAME", "Default name", "str", 0, 20),
     ("Behavior", "DEFAULT_ROOM", "Default room", "str", 1, 60),
+    ("Behavior", "FONT_SYNC",
+     "Share the fonts folder with the room (1 = yes, 0 = no)", "int", 0, 1),
+    ("Behavior", "FONT_FOLDER", "Shared fonts folder", "str", 1, 300),
     ("Images", "THUMB_W", "Thumbnail width", "int", 60, 800),
     ("Images", "THUMB_H", "Thumbnail height", "int", 40, 800),
     ("Images", "MAX_IMAGE_MB", "Biggest image allowed (MB)", "int", 1, 15),
@@ -634,6 +640,130 @@ def install_font_file(data, filename):
     return path
 
 
+# -------------------------------------------------------- shared fonts folder
+# Everyone's copy keeps a folder of font files (default ~/StudyChatFonts).
+# Free fonts downloaded with "get fonts" are saved in it, and so is anything
+# you drop in it. The room is told what's in it, and anyone who wants a font
+# can ask for it (after a prompt). Nothing outside this folder is ever shared,
+# and a font is only sent to the person who asked for it.
+MAX_FONT_BYTES = 5_000_000
+MAX_SHARED_FONTS = 30
+FONT_MAGIC = (b"\x00\x01\x00\x00", b"OTTO", b"true")
+
+
+def font_hash(data):
+    return hashlib.sha256(data).hexdigest()[:16]
+
+
+def looks_like_font(data):
+    return (isinstance(data, (bytes, bytearray))
+            and 12 < len(data) <= MAX_FONT_BYTES
+            and bytes(data[:4]) in FONT_MAGIC)
+
+
+def safe_font_name(name, ext=None):
+    """A plain file name (letters, digits, dots, dashes) ending in .ttf/.otf."""
+    stem, own = os.path.splitext(os.path.basename(str(name)))
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "", stem)[:60].strip(".") or "font"
+    ext = (ext or own or "").lower()
+    return stem + (ext if ext in (".ttf", ".otf") else ".ttf")
+
+
+def font_family_name(data):
+    """The family name stored inside a font file, or None."""
+    try:
+        count = struct.unpack(">H", data[4:6])[0]
+        for i in range(min(count, 64)):
+            tag, _sum, off, size = struct.unpack(
+                ">4sIII", data[12 + 16 * i:28 + 16 * i])
+            if tag != b"name":
+                continue
+            t = bytes(data[off:off + size])
+            _fmt, n, base = struct.unpack(">HHH", t[:6])
+            best = None
+            for j in range(min(n, 300)):
+                pid, _eid, _lid, nid, ln, o = struct.unpack(
+                    ">HHHHHH", t[6 + 12 * j:18 + 12 * j])
+                if nid not in (1, 16):
+                    continue
+                raw = t[base + o:base + o + ln]
+                try:
+                    s = raw.decode("utf-16-be" if pid in (0, 3)
+                                   else "mac_roman")
+                except ValueError:
+                    continue
+                s = "".join(c for c in s if c.isprintable()).strip()[:60]
+                rank = (nid == 1, pid == 3)
+                if s and (best is None or rank > best[0]):
+                    best = (rank, s)
+            return best[1] if best else None
+    except Exception:
+        pass
+    return None
+
+
+def scan_font_folder(folder, cache):
+    """Fonts in the shared folder, as {hash: {"n": name, "s": size, "path"}}.
+    `cache` remembers hashes so unchanged files aren't read again."""
+    found = {}
+    try:
+        names = sorted(os.listdir(folder))
+    except OSError:
+        return found
+    for fname in names:
+        if len(found) >= MAX_SHARED_FONTS:
+            break
+        if not fname.lower().endswith((".ttf", ".otf")):
+            continue
+        path = os.path.join(folder, fname)
+        try:
+            st = os.stat(path)
+            if not os.path.isfile(path) or not 12 < st.st_size <= MAX_FONT_BYTES:
+                continue
+            key = (path, st.st_size, int(st.st_mtime))
+            h = cache.get(key)
+            if h is None:
+                with open(path, "rb") as f:
+                    data = f.read(MAX_FONT_BYTES + 1)
+                if not looks_like_font(data):
+                    continue
+                h = font_hash(data)
+                cache[key] = h
+        except OSError:
+            continue
+        found.setdefault(h, {"n": safe_font_name(fname), "s": st.st_size,
+                             "path": path})
+    return found
+
+
+def save_to_font_folder(folder, data, name):
+    """Copy a font into the shared folder unless it's already there.
+    Returns the new path, or None if it was already saved."""
+    os.makedirs(folder, exist_ok=True)
+    if font_hash(data) in scan_font_folder(folder, {}):
+        return None
+    stem, ext = os.path.splitext(safe_font_name(
+        name, ".otf" if bytes(data[:4]) == b"OTTO" else ".ttf"))
+    path, k = os.path.join(folder, stem + ext), 1
+    while os.path.exists(path):
+        k += 1
+        path = os.path.join(folder, f"{stem}-{k}{ext}")
+    with open(path, "wb") as f:
+        f.write(data)
+    return path
+
+
+def open_folder(path):
+    """Show a folder in the computer's file browser."""
+    os.makedirs(path, exist_ok=True)
+    if sys.platform == "win32":
+        os.startfile(path)
+    elif sys.platform == "darwin":
+        subprocess.Popen(["open", path])
+    else:
+        subprocess.Popen(["xdg-open", path])
+
+
 MAX_GIF_FRAMES = 100       # more frames than this are skipped to save memory
 LIVE_GIFS = 5              # only the newest few GIFs in the chat animate
 
@@ -674,6 +804,11 @@ def shrink_gif(data, limit):
 
 
 # ---------------------------------------------------------------- networking
+# Quiet "ping" messages that carry one of these are real requests (a game
+# move, a font file...), so the relay must retry them, never drop them.
+LOUD_KEYS = ("items", "flip", "game", "fontreq", "blob")
+
+
 class Net:
     """Text goes out by UDP broadcast. Images are announced by broadcast, then
     each laptop downloads the picture directly from the sender over TCP."""
@@ -786,6 +921,21 @@ class Net:
         self._broadcast(msg)
         return dict(msg, data=data)
 
+    def send_blob(self, data, extra):
+        """A file meant for one person (a font). Announced like an image,
+        but only the person named in extra["to"] downloads it."""
+        mid = uuid.uuid4().hex
+        self.images[mid] = data
+        while len(self.images) > 20:
+            self.images.pop(next(iter(self.images)))
+        msg = {"app": "studychat", "room": self.room, "id": mid,
+               "name": self.name, "text": "", "type": "ping",
+               "uid": self.uid, "port": self.img_port, "size": len(data)}
+        msg.update(extra)
+        self.seen.add(mid)
+        self._broadcast(msg)
+        return msg
+
     # --- serving images to other laptops
     def _serve(self):
         while True:
@@ -844,6 +994,11 @@ class Net:
             if not mid or mid in self.seen:   # own echo or duplicate packet
                 continue
             self.seen.add(mid)
+            if msg.get("blob") == "font":
+                if msg.get("to") == self.uid:    # only the one who asked
+                    threading.Thread(target=self._fetch,
+                                     args=(msg, addr[0]), daemon=True).start()
+                continue
             if msg.get("type") == "img":
                 threading.Thread(target=self._fetch, args=(msg, addr[0]),
                                  daemon=True).start()
@@ -869,9 +1024,12 @@ class Net:
                 raise ValueError("short read")
             msg["data"] = bytes(buf)
         except Exception:
-            msg = {"type": "msg", "id": msg.get("id"),
-                   "name": msg.get("name", "?"),
-                   "text": "(sent an image that didn't load)"}
+            if msg.get("blob"):
+                msg = {"type": "font_fail", "h": msg.get("h")}
+            else:
+                msg = {"type": "msg", "id": msg.get("id"),
+                       "name": msg.get("name", "?"),
+                       "text": "(sent an image that didn't load)"}
         self.inbox.put(msg)
 
 
@@ -939,19 +1097,31 @@ class RelayNet:
         self.sendq.put((msg, data))
         return dict(msg, data=data)
 
+    def send_blob(self, data, extra):
+        """A file meant for one person (a font), sent as an attachment."""
+        msg = {"app": "studychat", "room": self.room, "id": uuid.uuid4().hex,
+               "name": self.name, "text": "", "type": "ping",
+               "uid": self.uid, "size": len(data)}
+        msg.update(extra)
+        self.seen.add(msg["id"])
+        self.sendq.put((msg, data))
+        return msg
+
     # Quiet signals (joined, who's here, still here) are not chat, but they
     # are how people see each other. If the relay is busy they used to be
     # thrown away, so nobody ever appeared. Now they are held and retried,
     # and a newer signal of the same kind replaces an older one.
     HOLD_FOR = {"join": 300, "ping:keepalive": 600, "ping:who": 30,
-                "ping:roster": 30}
+                "ping:roster": 30, "ping:fontlist": 300}
 
     @staticmethod
     def _key(msg):
         t = msg.get("type")
         if t == "ping":
             return "ping:" + ("who" if msg.get("text") == "who" else
-                              "roster" if "roster" in msg else "keepalive")
+                              "roster" if "roster" in msg else
+                              "fontlist" if "fontlist" in msg else
+                              "keepalive")
         return t
 
     def _hold(self, msg, data, born, tries, fresh):
@@ -985,8 +1155,9 @@ class RelayNet:
                 if time.time() - born > self.HOLD_FOR.get(key, 0):
                     continue                     # too old to be useful
             quiet = (msg.get("type") in ("ping", "join", "leave")
-                     and "items" not in msg     # history must not be dropped
-                     and "flip" not in msg)
+                     # history, flips, game moves and font files must never
+                     # be dropped
+                     and not any(k in msg for k in LOUD_KEYS))
             try:
                 if (quiet and msg.get("type") != "leave"
                         and time.time() < self.cool_until):
@@ -999,7 +1170,8 @@ class RelayNet:
                             url, data=meta.encode("utf-8"), method="POST")
                     else:
                         ext = ("png" if data.startswith(b"\x89PNG") else
-                               "gif" if data.startswith(b"GIF8") else "jpg")
+                               "gif" if data.startswith(b"GIF8") else
+                               "ttf" if msg.get("blob") == "font" else "jpg")
                         req = urllib.request.Request(
                             url, data=data, method="PUT",
                             headers={"Filename": f"image.{ext}",
@@ -1111,6 +1283,12 @@ class RelayNet:
         self.seen.add(mid)
         msg.pop("data", None)
         att = ev.get("attachment")
+        if msg.get("blob") == "font":
+            url = att.get("url") if isinstance(att, dict) else None
+            if msg.get("to") == self.uid and url:    # only the one who asked
+                threading.Thread(target=self._fetch, args=(msg, url),
+                                 daemon=True).start()
+            return
         if msg.get("type") == "img":
             url = att.get("url") if isinstance(att, dict) else None
             if url:
@@ -1131,9 +1309,12 @@ class RelayNet:
                 raise ValueError("bad size")
             msg["data"] = data
         except Exception:
-            msg = {"type": "msg", "id": msg.get("id"),
-                   "name": msg.get("name", "?"),
-                   "text": "(sent an image that didn't load)"}
+            if msg.get("blob"):
+                msg = {"type": "font_fail", "h": msg.get("h")}
+            else:
+                msg = {"type": "msg", "id": msg.get("id"),
+                       "name": msg.get("name", "?"),
+                       "text": "(sent an image that didn't load)"}
         self.inbox.put(msg)
 
 
@@ -1405,6 +1586,16 @@ class Overlay:
         self._installed = None              # fonts on this computer
         self.font_warned = set()
         self.font_offers = {}               # lower name -> free font to offer
+        self.font_cache = {}                # shared folder: file -> hash
+        self.font_mine = {}                 # hash -> info, files in my folder
+        self.font_announced = frozenset()   # what the room was last told
+        self.font_due = time.time() + 8     # when to look at the folder next
+        self.font_share_offers = {}         # hash -> font a friend shared
+        self.font_wanted = {}               # hash -> font I asked a friend for
+        self.font_seen = set()              # hashes I have (never offer again)
+        self.font_served = []               # when I last sent a font away
+        self.font_folder_noted = False
+        self.game = None                    # the number guesser now running
         self.full_anims = []                # ...and in full-size viewers
         self.presence = Presence()
         # Joining already says "I'm here", so the first "still here" signal
@@ -2298,6 +2489,11 @@ class Overlay:
     def _fill_menu(self, m):
         m.add_command(label="Who's online", command=self.show_who)
         m.add_separator()
+        if self.game and not self.game["over"] and self.game["mine"]:
+            m.add_command(label="End the number guesser",
+                          command=self.game_end_cmd)
+        else:
+            m.add_command(label="Number guesser...", command=self.game_cmd)
         m.add_command(label="Flip everyone's chat", command=self.flip_cmd)
         m.add_command(label="Send GIF of the reel", command=self.clip_reel)
         m.add_command(label="Pick the reel area again",
@@ -2305,9 +2501,12 @@ class Overlay:
         m.add_command(label="Instagram reels window",
                       command=self.open_reels)
         m.add_separator()
-        if self.font_offers:
-            m.add_command(label=f"Get fonts ({len(self.font_offers)})",
+        if self.font_offers or self.font_share_offers:
+            m.add_command(label="Get fonts ("
+                          f"{len(self.font_offers) + len(self.font_share_offers)})",
                           command=self.fonts_cmd)
+        m.add_command(label="Open shared fonts folder",
+                      command=self.open_fonts_folder)
         if self.update_info:
             m.add_command(label=f"Update to v{self.update_info['version']}",
                           command=self.update_cmd)
@@ -2876,6 +3075,12 @@ class Overlay:
         if text == "/getfonts":
             self.fonts_cmd()
             return
+        if text == "/fontsfolder":
+            self.open_fonts_folder()
+            return
+        if text in ("/guess", "/numberguess"):
+            self.game_cmd()
+            return
         if text == "/reels" or text.startswith("/reels "):
             self.open_reels(text[6:])
             return
@@ -2907,6 +3112,505 @@ class Overlay:
             log("poll failed: " + traceback.format_exc())
         finally:
             self.root.after(100, self.poll)
+
+    # ---- shared fonts folder (see the notes above scan_font_folder)
+    def _fonts_dir(self):
+        return os.path.expanduser(
+            getattr(self, "fonts_dir_override", None) or FONT_FOLDER)
+
+    def _fonts_label(self):
+        """The "get fonts (n)" link in the top bar."""
+        n = len(self.font_offers) + len(self.font_share_offers)
+        if n:
+            self.fonts_lbl.config(text=f"get fonts ({n})")
+            self.fonts_lbl.pack(side="right", padx=6)
+        else:
+            self.fonts_lbl.pack_forget()
+
+    def open_fonts_folder(self):
+        try:
+            open_folder(self._fonts_dir())
+        except Exception:
+            log("open folder failed: " + traceback.format_exc())
+        self.note("shared fonts folder: " + self._fonts_dir() + "  (font "
+                  "files you put in it are offered to everyone in the room)")
+
+    def _fonts_tick(self, now):
+        """Every so often: look at the folder and tell the room what's in it."""
+        if not FONT_SYNC or now < self.font_due:
+            return
+        self.font_due = now + 15
+        folder = self._fonts_dir()
+        try:
+            fresh = not os.path.isdir(folder)
+            os.makedirs(folder, exist_ok=True)
+        except OSError:
+            return
+        if fresh and not self.font_folder_noted:
+            self.font_folder_noted = True
+            self.note("shared fonts folder: " + folder + "  (font files you "
+                      "put in it are offered to everyone in the room)")
+        self.font_mine = scan_font_folder(folder, self.font_cache)
+        self.font_seen.update(self.font_mine)    # never offer me my own fonts
+        mine = frozenset(self.font_mine)
+        if (mine and mine != self.font_announced
+                and getattr(self.net, "join_ok", True)):
+            self.font_announced = mine
+            items = [{"h": h, "n": i["n"], "s": i["s"]}
+                     for h, i in self.font_mine.items()]
+            self.net.send("", kind="ping", extra={"fontlist": items})
+        elif not mine:
+            self.font_announced = frozenset()
+        for h, w in list(self.font_wanted.items()):      # nobody answered
+            if now > w["until"]:
+                del self.font_wanted[h]
+                self.note(f"couldn't get the font \"{w['n']}\" from "
+                          f"{w['who']}")
+
+    def _fontlist_msg(self, msg):
+        """Someone told the room which fonts are in their shared folder."""
+        if not FONT_SYNC:
+            return
+        uid, who = msg.get("uid"), msg["name"]
+        if not (isinstance(uid, str) and uid):
+            return
+        theirs, new = set(), []
+        for it in msg["fontlist"][:MAX_SHARED_FONTS]:
+            if not isinstance(it, dict):
+                continue
+            h, n, s = it.get("h"), it.get("n"), it.get("s")
+            if not (isinstance(h, str) and re.fullmatch(r"[0-9a-f]{16}", h)
+                    and isinstance(n, str) and isinstance(s, int)
+                    and not isinstance(s, bool) and 0 < s <= MAX_FONT_BYTES):
+                continue
+            theirs.add(h)
+            if (h in self.font_seen or h in self.font_wanted
+                    or h in self.font_share_offers):
+                continue
+            n = safe_font_name(n)
+            self.font_share_offers[h] = {"h": h, "n": n, "s": s,
+                                         "uid": uid, "who": who}
+            new.append(n)
+        if theirs >= set(self.font_mine):    # they already told everyone mine
+            self.font_announced = frozenset(self.font_mine)
+        if new:
+            self._fonts_label()
+            more = "..." if len(new) > 3 else ""
+            self._deliver({"type": "sys", "name": "", "text":
+                           f"{who} shared {len(new)} font"
+                           f"{'s' if len(new) != 1 else ''} "
+                           f"({', '.join(new[:3])}{more}). Click \"get fonts\""
+                           " in the top bar (or type /getfonts) to install."})
+
+    def _request_fonts(self, offers):
+        """The person said yes: ask each friend for the font they shared."""
+        self.note("asking for fonts...")
+        for k, o in enumerate(offers):
+            self.font_share_offers.pop(o["h"], None)
+            self.font_wanted[o["h"]] = {"n": o["n"], "uid": o["uid"],
+                                        "who": o["who"],
+                                        "until": time.time() + 90}
+            self.root.after(300 * k, lambda o=o: self.net.send(
+                "", kind="ping",
+                extra={"fontreq": {"h": o["h"], "to": o["uid"]}}))
+
+    def _fontreq_msg(self, msg):
+        """Someone asks me for a font from my shared folder."""
+        req = msg["fontreq"]
+        h, who = req.get("h"), msg.get("uid")
+        if (not FONT_SYNC or req.get("to") != self.net.uid
+                or not isinstance(h, str) or not isinstance(who, str)
+                or not who):
+            return
+        info = self.font_mine.get(h)         # only files in my shared folder
+        if not info:
+            return
+        now = time.time()
+        self.font_served = [t for t in self.font_served if now - t < 60]
+        if len(self.font_served) >= 6:       # don't let anyone drain uploads
+            return
+        try:
+            with open(info["path"], "rb") as f:
+                data = f.read(MAX_FONT_BYTES + 1)
+        except OSError:
+            return
+        if not looks_like_font(data) or font_hash(data) != h:
+            return
+        self.font_served.append(now)
+        self.net.send_blob(data, {"blob": "font", "h": h, "fname": info["n"],
+                                  "to": who})
+
+    def _fontblob_msg(self, msg):
+        """A font file arrived. Only accepted if I asked that friend for it."""
+        h, data = msg.get("h"), msg.get("data")
+        w = self.font_wanted.get(h) if isinstance(h, str) else None
+        if (not w or msg.get("to") != self.net.uid
+                or msg.get("uid") != w["uid"]):
+            return                           # I never asked for this
+        del self.font_wanted[h]
+        if not looks_like_font(data) or font_hash(data) != h:
+            self.note(f"the font \"{w['n']}\" from {w['who']} was damaged, "
+                      "so it was skipped")
+            return
+        self.font_seen.add(h)
+        threading.Thread(target=self._font_file_worker,
+                         args=(bytes(data), w["n"], h), daemon=True).start()
+
+    def _on_font_fail(self, msg):
+        h = msg.get("h")
+        w = self.font_wanted.pop(h, None) if isinstance(h, str) else None
+        if w:
+            self.note(f"couldn't download the font \"{w['n']}\" from "
+                      f"{w['who']}")
+
+    def _font_file_worker(self, data, name, h):
+        fam = font_family_name(data) or os.path.splitext(name)[0]
+        try:
+            try:                             # keep a copy in the shared folder
+                save_to_font_folder(self._fonts_dir(), data, name)
+            except OSError:
+                log("couldn't copy a font to the shared folder")
+            ext = ".otf" if data[:4] == b"OTTO" else ".ttf"
+            install_font_file(data, f"sc-{h[:8]}-{safe_font_name(name, ext)}")
+            self.inbox.put({"type": "fonts_done", "ok": [fam], "failed": []})
+        except Exception:
+            log("font install failed: " + traceback.format_exc())
+            self.inbox.put({"type": "fonts_done", "ok": [], "failed": [fam]})
+
+    # ---- number guesser
+    # One person picks a secret number. Everyone else gets a popup and one
+    # guess, and a wrong guess closes that person's chat. The secret never
+    # leaves the host's computer: guesses go to the host, who answers each
+    # one. Nobody is ever disconnected unless the host answers "wrong" to a
+    # guess that person made themselves, in a game they were shown.
+    GAME_MAX = 1_000_000
+    GAME_SECONDS = 900
+
+    @staticmethod
+    def _whole(v, lo, hi):
+        """v if it's a whole number from lo to hi, else None."""
+        if isinstance(v, bool) or not isinstance(v, int) or not lo <= v <= hi:
+            return None
+        return v
+
+    @staticmethod
+    def _int_text(s):
+        try:
+            return int(str(s).strip())
+        except ValueError:
+            return None
+
+    def game_cmd(self):
+        """Menu or /guess: pick a secret number for everyone else to guess."""
+        G = self.game
+        if G and not G["over"]:
+            who = "you are" if G["mine"] else f"{G['host']} is"
+            self.note(f"{who} already running a number guesser")
+            return
+        self._game_host_window()
+
+    def game_end_cmd(self):
+        G = self.game
+        if not (G and G["mine"] and not G["over"]):
+            return
+        self.net.send("", kind="ping",
+                      extra={"game": {"op": "end", "gid": G["gid"]}})
+        G["over"] = True
+        self.note("you ended the number guesser")
+
+    def _game_host_window(self):
+        tk = self.tk
+        win = tk.Toplevel(self.root)
+        win.title("Number guesser")
+        win.configure(bg=BG)
+        win.attributes("-topmost", True)
+        self.busy = True
+
+        def label(text, fg=FG, font=None):
+            lb = tk.Label(win, text=text, bg=BG, fg=fg, font=font or F(),
+                          justify="left")
+            lb.pack(anchor="w", padx=14, pady=(8, 0))
+            return lb
+
+        label("Pick a secret number", font=F(2, True))
+        label("Everyone else gets a popup and one guess.\n"
+              "A wrong guess disconnects them.", fg=MUTED)
+        label("Your number:")
+        secret = tk.Entry(win, show="*", font=F())   # hidden: no peeking
+        secret.pack(fill="x", padx=14)
+        label("Highest it could be (they guess from 1 up to this):")
+        top = tk.Entry(win, font=F())
+        top.insert(0, "10")
+        top.pack(fill="x", padx=14)
+        err = label("", fg="#ff7a7a")
+
+        def close(_e=None):
+            try:
+                win.destroy()
+            except Exception:
+                pass
+            self.busy = self.settings_win is not None
+            self._touch()
+
+        def go(_e=None):
+            mx = self._whole(self._int_text(top.get()), 2, self.GAME_MAX)
+            if mx is None:
+                err.config(text="The highest number must be a whole number "
+                                f"from 2 to {self.GAME_MAX:,}.")
+                return
+            n = self._whole(self._int_text(secret.get()), 1, mx)
+            if n is None:
+                err.config(text=f"Your number must be a whole number from "
+                                f"1 to {mx}.")
+                return
+            close()
+            self._game_start(n, mx)
+
+        row = tk.Frame(win, bg=BG)
+        row.pack(pady=12)
+        tk.Button(row, text="Start", width=10, command=go).pack(
+            side="left", padx=6)
+        tk.Button(row, text="Cancel", width=10, command=close).pack(
+            side="left", padx=6)
+        for w in (secret, top):
+            w.bind("<Return>", go)
+        win.bind("<Escape>", close)
+        win.protocol("WM_DELETE_WINDOW", close)
+        self._center(win)
+        win.focus_force()
+        secret.focus_force()
+
+    def _center(self, win):
+        try:
+            win.update_idletasks()
+            w, h = win.winfo_reqwidth(), win.winfo_reqheight()
+            win.geometry("+%d+%d" % (
+                max(0, (self.root.winfo_screenwidth() - w) // 2),
+                max(0, (self.root.winfo_screenheight() - h) // 3)))
+        except Exception:
+            pass
+
+    def _game_start(self, secret, mx):
+        gid = uuid.uuid4().hex[:12]
+        self.game = {"gid": gid, "host_uid": self.net.uid,
+                     "host": self.net.name, "max": mx, "mine": True,
+                     "secret": secret, "over": False, "t0": time.time(),
+                     "guessed": {}, "my_guess": None, "win": None, "ui": None}
+        self.net.send("", kind="ping",
+                      extra={"game": {"op": "start", "gid": gid, "max": mx}})
+        self.note(f"you started the number guesser (1 to {mx}). Everyone "
+                  "else got a popup. Use the menu to end it.")
+
+    def _game_msg(self, msg):
+        """Everything the number guesser sends or receives. Messages come
+        from other computers, so every field is checked."""
+        g, uid = msg["game"], msg.get("uid")
+        if not isinstance(uid, str) or not uid:
+            return
+        op, gid = g.get("op"), g.get("gid")
+        if not (isinstance(gid, str) and re.fullmatch(r"[0-9a-f]{12}", gid)):
+            return
+        G = self.game
+        if op == "start":
+            mx = self._whole(g.get("max"), 2, self.GAME_MAX)
+            if mx is None or (G and not G["over"]):   # one game at a time
+                return
+            self.game = {"gid": gid, "host_uid": uid, "host": msg["name"],
+                         "max": mx, "mine": False, "secret": None,
+                         "over": False, "t0": time.time(), "guessed": {},
+                         "my_guess": None, "win": None, "ui": None}
+            self.note(f"{msg['name']} started a number guesser")
+            try:
+                self._game_popup()
+            except Exception:
+                log("game popup failed: " + traceback.format_exc())
+            return
+        if not G or G["gid"] != gid or G["over"]:
+            return
+        if op == "guess" and G["mine"]:                # I'm the host
+            n = self._whole(g.get("n"), 1, G["max"])
+            if n is None:
+                return
+            first = uid not in G["guessed"]
+            if first:
+                G["guessed"][uid] = (n, n == G["secret"])
+            n, ok = G["guessed"][uid]    # asked twice? same answer again
+            res = {"op": "result", "gid": gid, "guid": uid,
+                   "gname": msg["name"][:20], "n": n, "ok": ok}
+            if ok:
+                res["secret"] = G["secret"]
+            self.net.send("", kind="ping", extra={"game": res})
+            if first:
+                self._game_announce(msg["name"], n, ok, G["secret"])
+                if ok:
+                    G["over"] = True
+        elif op == "result" and not G["mine"] and uid == G["host_uid"]:
+            n = self._whole(g.get("n"), 1, G["max"])
+            guid, ok = g.get("guid"), g.get("ok") is True
+            gname = str(g.get("gname", "?"))[:20]
+            secret = self._whole(g.get("secret"), 1, G["max"])
+            if n is None or not isinstance(guid, str) or (ok and secret is None):
+                return
+            # Only a guess I made myself can disconnect me.
+            mine = guid == self.net.uid and G["my_guess"] == n
+            self._game_announce(gname, n, ok, secret)
+            if ok:
+                G["over"] = True
+            self._game_result_ui(mine, ok, gname, n, secret)
+        elif op == "end" and not G["mine"] and uid == G["host_uid"]:
+            G["over"] = True
+            self._game_close_window()
+            self.note(f"{G['host']} ended the number guesser")
+
+    def _game_announce(self, gname, n, ok, secret):
+        self._deliver({"type": "sys", "name": "", "text":
+                       f"{gname} guessed {n} and got it! The number was "
+                       f"{secret}." if ok else
+                       f"{gname} guessed {n}: wrong! {gname} gets "
+                       "disconnected."})
+
+    def _game_popup(self):
+        """The window that appears for everyone except the host."""
+        G, tk = self.game, self.tk
+        win = tk.Toplevel(self.root)
+        win.title("Number guesser")
+        win.configure(bg=BG)
+        win.attributes("-topmost", True)
+        self.busy = True
+        title = tk.Label(win, text=f"{G['host']} is thinking of a number",
+                         bg=BG, fg=FG, font=F(3, True))
+        title.pack(padx=20, pady=(16, 4))
+        info = tk.Label(win, bg=BG, fg=MUTED, font=F(), justify="center",
+                        text=f"Pick a whole number from 1 to {G['max']}.\n"
+                             "You only get one guess. Guess wrong and the "
+                             "chat disconnects you.")
+        info.pack(padx=20)
+        entry = tk.Entry(win, font=F(2), justify="center", width=10)
+        entry.pack(pady=10)
+        status = tk.Label(win, text="", bg=BG, fg="#ff7a7a", font=F())
+        status.pack()
+        row = tk.Frame(win, bg=BG)
+        row.pack(pady=(4, 16))
+        guess_btn = tk.Button(row, text="Guess", width=10,
+                              command=self._game_submit)
+        guess_btn.pack(side="left", padx=6)
+        skip_btn = tk.Button(row, text="No thanks", width=10,
+                             command=self._game_skip)
+        skip_btn.pack(side="left", padx=6)
+        entry.bind("<Return>", lambda e: self._game_submit())
+        win.bind("<Escape>", lambda e: self._game_skip())
+        win.protocol("WM_DELETE_WINDOW", self._game_skip)
+        G["win"] = win
+        G["ui"] = {"title": title, "info": info, "entry": entry,
+                   "status": status, "guess": guess_btn, "skip": skip_btn}
+        self._center(win)
+        win.focus_force()
+        entry.focus_force()
+
+    def _game_submit(self):
+        G = self.game
+        if (not G or G["mine"] or G["over"] or G["my_guess"] is not None
+                or not G.get("ui")):
+            return
+        ui = G["ui"]
+        n = self._whole(self._int_text(ui["entry"].get()), 1, G["max"])
+        if n is None:
+            ui["status"].config(
+                text=f"Enter a whole number from 1 to {G['max']}")
+            return
+        G["my_guess"], G["asked_at"], G["resent"] = n, time.time(), False
+        self._game_send_guess(n)
+        ui["status"].config(text=f"Waiting for {G['host']}...", fg=MUTED)
+        for k in ("entry", "guess", "skip"):
+            try:
+                ui[k].config(state="disabled")
+            except Exception:
+                pass
+
+    def _game_send_guess(self, n):
+        G = self.game
+        self.net.send("", kind="ping", extra={
+            "game": {"op": "guess", "gid": G["gid"], "n": n}})
+
+    def _game_skip(self):
+        """"No thanks": close the popup. Skipping is never punished."""
+        self._game_close_window()
+
+    def _game_result_ui(self, mine, ok, gname, n, secret):
+        G = self.game
+        ui = G.get("ui") if G else None
+        if not ui:
+            if mine and not ok:              # popup gone, but still wrong
+                self.root.after(2500, self.disconnect)
+            return
+        if ok:
+            text = (f"Awesome! You got it!\nThe number was {n}." if mine else
+                    f"{gname} got it!\nThe number was {secret}.")
+            color = "#7be08a"
+        elif mine:
+            text = f"Wrong! The number wasn't {n}.\nDisconnecting..."
+            color = "#ff7a7a"
+        else:
+            return                           # someone else missed: keep going
+        for k in ("info", "entry", "status", "guess", "skip"):
+            try:
+                ui[k].pack_forget()
+            except Exception:
+                pass
+        ui["title"].config(text=text, fg=color)
+        if mine and not ok:
+            self.root.after(2500, self.disconnect)
+        else:
+            gid = G["gid"]
+            self.root.after(5000, lambda: self._game_close_window(gid))
+
+    def _game_close_window(self, gid=None):
+        G = self.game
+        if gid is not None and (not G or G["gid"] != gid):
+            return
+        win = G.get("win") if G else None
+        if win is not None:
+            try:
+                win.destroy()
+            except Exception:
+                pass
+            G["win"] = G["ui"] = None
+        self.busy = self.settings_win is not None
+        self._touch()
+
+    def _game_peer_left(self, uid):
+        G = self.game
+        if G and not G["mine"] and not G["over"] and uid == G["host_uid"]:
+            G["over"] = True
+            self._game_close_window()
+            self.note(f"{G['host']} left, so the number guesser ended")
+
+    def _game_tick(self, now):
+        G = self.game
+        if not G or G["over"]:
+            return
+        if now - G["t0"] > self.GAME_SECONDS:        # nobody finished it
+            if G["mine"]:
+                self.net.send("", kind="ping",
+                              extra={"game": {"op": "end", "gid": G["gid"]}})
+            G["over"] = True
+            self._game_close_window()
+            self.note("the number guesser timed out")
+            return
+        if G["mine"] or G["my_guess"] is None:
+            return
+        waited = now - G["asked_at"]
+        if waited > 20 and not G["resent"]:          # the guess may be lost
+            G["resent"] = True
+            self._game_send_guess(G["my_guess"])
+        elif waited > 50 and G.get("ui") and not G.get("gave_up"):
+            G["gave_up"] = True                      # never kick without an answer
+            G["ui"]["status"].config(
+                text=f"No answer from {G['host']} yet.", fg="#ff7a7a")
+            try:
+                G["ui"]["skip"].config(state="normal")
+            except Exception:
+                pass
 
     def _font_set(self):
         """Fonts installed on this computer (lower case)."""
@@ -2946,8 +3650,7 @@ class Overlay:
             self.font_offers[family.lower()] = {
                 "family": family, "name": msg["res"]["name"],
                 "urls": msg["res"]["urls"]}
-            self.fonts_lbl.config(text=f"get fonts ({len(self.font_offers)})")
-            self.fonts_lbl.pack(side="right", padx=6)
+            self._fonts_label()
             text = (f'{who} uses the font "{family}". It\'s a free font: '
                     'click "get fonts" in the top bar (or type /getfonts) '
                     "to install it.")
@@ -2962,18 +3665,27 @@ class Overlay:
 
     def fonts_cmd(self):
         """Click on "get fonts" or /getfonts: ask, then download."""
-        if not self.font_offers:
+        if not (self.font_offers or self.font_share_offers):
             self.note("no fonts to download right now")
             return
         from tkinter import messagebox
         offers = list(self.font_offers.values())
-        names = "\n".join("  " + o["family"] for o in offers[:12])
+        shared = list(self.font_share_offers.values())[:8]
+        parts = []
+        if offers:
+            parts.append("Free fonts from Google Fonts:\n" + "\n".join(
+                "  " + o["family"] for o in offers[:12]))
+        if shared:
+            parts.append("Fonts your friends shared (only accept fonts from "
+                         "people you trust):\n" + "\n".join(
+                             f"  {o['n']} ({max(1, o['s'] // 1024)} KB) from "
+                             f"{o['who']}" for o in shared))
         self.busy = True
         try:
             ok = messagebox.askyesno(
                 "Study chat",
-                "Download and install these free fonts from Google Fonts?\n\n"
-                f"{names}\n\nThey are installed for your user only, and you "
+                "Install these fonts?\n\n" + "\n\n".join(parts) +
+                "\n\nThey are installed for your user only, and you "
                 "can remove them any time from your computer's font list.",
                 parent=self.root)
         finally:
@@ -2981,10 +3693,13 @@ class Overlay:
         if not ok:
             return
         self.font_offers = {}
-        self.fonts_lbl.pack_forget()
-        self.note("downloading fonts...")
-        threading.Thread(target=self._font_install_worker, args=(offers,),
-                         daemon=True).start()
+        if shared:
+            self._request_fonts(shared)
+        self._fonts_label()
+        if offers:
+            self.note("downloading fonts...")
+            threading.Thread(target=self._font_install_worker,
+                             args=(offers,), daemon=True).start()
 
     def _font_install_worker(self, offers):
         done, failed = [], []
@@ -2994,8 +3709,13 @@ class Overlay:
                 for i, url in enumerate(o["urls"]):
                     ext = ".otf" if url.split("?")[0].lower().endswith(
                         ".otf") else ".ttf"
-                    install_font_file(download_font(url),
-                                      f"{stem}-{i + 1}{ext}")
+                    data = download_font(url)
+                    install_font_file(data, f"{stem}-{i + 1}{ext}")
+                    try:             # keep a copy in the shared fonts folder
+                        save_to_font_folder(self._fonts_dir(), data,
+                                            f"{stem}-{i + 1}{ext}")
+                    except OSError:
+                        log("couldn't copy a font to the shared folder")
                 done.append(o["family"])
             except Exception:
                 log("font install failed: " + traceback.format_exc())
@@ -3073,6 +3793,9 @@ class Overlay:
         if msg.get("type") == "fonts_done":
             self._on_fonts_done(msg)
             return
+        if msg.get("type") == "font_fail":
+            self._on_font_fail(msg)
+            return
         if msg.get("type") == "update_done":
             self._on_update_done(str(msg.get("version", "")))
             return
@@ -3088,6 +3811,30 @@ class Overlay:
             if not msg["font"]:
                 msg["font_want"] = want      # so it can be shown once installed
         self.presence.seen(msg, time.time())
+        mine = msg.get("uid") == self.net.uid
+        if not mine and msg.get("type") == "leave":
+            self._game_peer_left(msg.get("uid"))
+        if not mine and msg.get("type") == "join" and FONT_SYNC \
+                and self.font_mine:
+            # a newcomer doesn't know our fonts yet: tell them again soon
+            self.font_announced = frozenset()
+            self.font_due = min(self.font_due,
+                                time.time() + random.uniform(1, 8))
+        if not mine and msg.get("type") == "ping":
+            # Game moves and shared fonts travel as quiet "pings", so older
+            # versions of the app just ignore them.
+            if isinstance(msg.get("game"), dict):
+                self._game_msg(msg)
+                return
+            if isinstance(msg.get("fontlist"), list):
+                self._fontlist_msg(msg)
+                return
+            if isinstance(msg.get("fontreq"), dict):
+                self._fontreq_msg(msg)
+                return
+            if msg.get("blob") == "font":
+                self._fontblob_msg(msg)
+                return
         greet = JOIN_GREETINGS.get(msg["name"].strip().lower())
         if (greet and msg.get("type") == "join"
                 and msg.get("uid") != self.net.uid):
@@ -3190,6 +3937,11 @@ class Overlay:
                     120 if online else 15):
                 self.roll_done = True
                 self.update_online()
+            for job in (self._fonts_tick, self._game_tick):
+                try:
+                    job(now)
+                except Exception:
+                    log("background job failed: " + traceback.format_exc())
             # tell others we're still here, and notice when someone stops
             if now - self.last_ping > self.net.ping_every:
                 self.last_ping = now
