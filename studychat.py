@@ -4547,9 +4547,9 @@ class Overlay:
     # step and no polling. A pick is only said again if the other side stays
     # silent for a long time, and then only a few times.
     # Messages (all inside a "duel" ping, so old versions ignore them):
-    #   challenge / cancel / accept
+    #   challenge / cancel / accept / start
     #   p  = a pick {r: turn, m: move}. The challenger's first pick also
-    #        says who was chosen (vs), so there is no separate "go".
+    #        says who was chosen (vs) for older peers.
     #   n  = "I'm stuck on turn r, please say your pick again"
     #   q  = I quit
     DUEL_SECONDS = 1800
@@ -4671,13 +4671,30 @@ class Overlay:
                 and D["state"] in ("invited", "accepting"):
             self._duel_over(f"{D['host']} cancelled the duel")
         elif op == "accept" and D["mine"] and D["state"] == "waiting":
-            # the first accept wins; our first pick will tell them
+            # The first accept wins. A separate start message opens both
+            # duel windows before either player has to pick a move.
+            self._duel_send({"op": "start", "p2": uid,
+                             "n1": self.net.name})
             self._duel_start([self.net.uid, uid], [self.net.name, name])
             D["go"] = {"vs": uid, "n1": name}
             self.note(f"{name} accepted your duel! Pick your first move")
         elif op == "accept" and D["mine"] and D["state"] == "playing" \
                 and uid == D["uids"][1]:
-            self._duel_reply(1)                      # they missed our pick
+            if D["hist"].get(1) is None:
+                self._duel_send({"op": "start", "p2": uid,
+                                 "n1": self.net.name})
+            else:
+                self._duel_reply(1)                  # they missed our pick
+        elif op == "start" and not D["mine"] \
+                and uid == D["host_uid"] \
+                and D["state"] in ("invited", "accepting"):
+            if d.get("p2") != self.net.uid:
+                self._duel_over()
+                return
+            host_name = str(d.get("n1", D["host"]))[:20]
+            self._duel_close_popup()
+            self._duel_start([uid, self.net.uid],
+                             [host_name, self.net.name])
         elif op == "p" and uid == D["host_uid"] and not D["mine"] \
                 and D["state"] in ("invited", "accepting") and "vs" in d:
             if d.get("vs") == self.net.uid:          # the challenger chose us

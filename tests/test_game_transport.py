@@ -422,6 +422,68 @@ class DuelProtocolTests(unittest.TestCase):
         self.assertGreater(len(a.net.outbox.jobs), 1)
 
 
+class DuelHandshakeTests(unittest.TestCase):
+    def overlay(self, mine, state, uid, host_uid="host"):
+        ov = chat.Overlay.__new__(chat.Overlay)
+        ov.net = Mock()
+        ov.net.uid, ov.net.name = uid, "Player"
+        ov.duel = {
+            "gid": "0123456789ab", "host_uid": host_uid, "host": "Host",
+            "mine": mine, "state": state, "over": False,
+            "uids": ["host", "guest"], "names": ["Host", "Guest"],
+            "hist": {}, "reply_at": {},
+        }
+        ov._duel_send = Mock()
+        ov._duel_start = Mock()
+        ov._duel_close_popup = Mock()
+        ov._duel_over = Mock()
+        ov._duel_reply = Mock()
+        ov.note = Mock()
+        return ov
+
+    def test_challenger_acks_accept_and_starts_without_waiting_for_a_move(self):
+        host = self.overlay(True, "waiting", "host")
+
+        host._duel_msg({
+            "uid": "guest", "name": "Guest",
+            "duel": {"op": "accept", "gid": "0123456789ab"},
+        })
+
+        host._duel_send.assert_called_once_with({
+            "op": "start", "p2": "guest", "n1": "Player",
+        })
+        host._duel_start.assert_called_once_with(
+            ["host", "guest"], ["Player", "Guest"])
+        self.assertEqual(host.duel["state"], "waiting")
+        self.assertEqual(host.duel["go"], {"vs": "guest", "n1": "Guest"})
+
+    def test_acceptor_opens_duel_when_host_start_ack_arrives(self):
+        guest = self.overlay(False, "accepting", "guest")
+
+        guest._duel_msg({
+            "uid": "host", "name": "Host",
+            "duel": {"op": "start", "gid": "0123456789ab",
+                     "p2": "guest", "n1": "Host"},
+        })
+
+        guest._duel_close_popup.assert_called_once_with()
+        guest._duel_start.assert_called_once_with(
+            ["host", "guest"], ["Host", "Player"])
+        guest._duel_over.assert_not_called()
+
+    def test_start_ack_for_another_acceptor_does_not_start_duel(self):
+        guest = self.overlay(False, "accepting", "guest")
+
+        guest._duel_msg({
+            "uid": "host", "name": "Host",
+            "duel": {"op": "start", "gid": "0123456789ab",
+                     "p2": "someone-else", "n1": "Host"},
+        })
+
+        guest._duel_start.assert_not_called()
+        guest._duel_over.assert_called_once_with()
+
+
 class DuelStatusTests(unittest.TestCase):
     def setUp(self):
         self.room = Room()
