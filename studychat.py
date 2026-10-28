@@ -4666,6 +4666,9 @@ class Overlay:
             if D["state"] == "playing" and uid in D["uids"] \
                     and uid != self.net.uid and d.get("re") == 1:
                 self._duel_reply(self._whole(d.get("r"), 1, 100000))
+            elif D["state"] == "playing" and uid in D["uids"] \
+                    and uid != self.net.uid:
+                self._duel_rematch_msg(d, uid, name)
             return
         if op == "cancel" and uid == D["host_uid"] and not D["mine"] \
                 and D["state"] in ("invited", "accepting"):
@@ -4802,6 +4805,91 @@ class Overlay:
         self._duel_window()
         self._duel_begin_round()
 
+    def _duel_rematch(self):
+        D = self.duel
+        if not D or not D["over"] or D["state"] != "playing":
+            return
+        if D.get("solo"):
+            self._duel_restart(uuid.uuid4().hex[:12])
+            return
+        if D.get("rematch_state") not in (None, "ready", "declined"):
+            return
+        D["rematch_state"] = "waiting"
+        self._duel_send({"op": "rematch"})
+        ui = D.get("ui")
+        if ui:
+            ui["rematch"].config(state="disabled", text="Waiting...")
+            ui["info"].config(text="Waiting for your opponent to accept.")
+
+    def _duel_rematch_msg(self, d, uid, name):
+        D = self.duel
+        if uid != D["uids"][1 - D["me"]]:
+            return
+        op = d.get("op")
+        if op == "rematch" and D.get("rematch_state") in (
+                None, "ready", "declined"):
+            D["rematch_state"] = "incoming"
+            from tkinter import messagebox
+            try:
+                accept = messagebox.askyesno(
+                    "Rematch", f"{name} wants a rematch.",
+                    parent=D.get("win") or self.root)
+            except Exception:
+                D["rematch_state"] = "ready"
+                log("duel rematch prompt failed: " + traceback.format_exc())
+                self._duel_send({"op": "rematch_decline"})
+                return
+            if not accept:
+                D["rematch_state"] = "ready"
+                self._duel_send({"op": "rematch_decline"})
+                return
+            if D["mine"]:
+                self._duel_begin_rematch()
+            else:
+                D["rematch_state"] = "accepting"
+                self._duel_send({"op": "rematch_accept"})
+                ui = D.get("ui")
+                if ui:
+                    ui["rematch"].config(state="disabled",
+                                         text="Starting...")
+                    ui["info"].config(
+                        text="Accepted. Waiting for the rematch to start.")
+        elif op == "rematch_accept" and D["mine"] \
+                and D.get("rematch_state") == "waiting":
+            self._duel_begin_rematch()
+        elif op == "rematch_decline" \
+                and D.get("rematch_state") == "waiting":
+            D["rematch_state"] = "declined"
+            ui = D.get("ui")
+            if ui:
+                ui["rematch"].config(state="normal", text="Rematch")
+                ui["info"].config(text="Your opponent declined the rematch.")
+        elif op == "rematch_start" and not D["mine"] \
+                and D.get("rematch_state") in ("waiting", "accepting"):
+            new_gid = d.get("ngid")
+            if (d.get("p2") == self.net.uid
+                    and isinstance(new_gid, str)
+                    and re.fullmatch(r"[0-9a-f]{12}", new_gid)):
+                self._duel_restart(new_gid)
+
+    def _duel_begin_rematch(self):
+        D = self.duel
+        new_gid = uuid.uuid4().hex[:12]
+        self._duel_send({"op": "rematch_start", "p2": D["uids"][1],
+                         "ngid": new_gid})
+        self._duel_restart(new_gid)
+
+    def _duel_restart(self, gid):
+        D = self.duel
+        uids, names = D["uids"][:], D["names"][:]
+        host_uid, host, mine = D["host_uid"], D["host"], D["mine"]
+        solo = D.get("solo")
+        self._duel_close_window()
+        D.update(self._duel_blank(gid, host_uid, host, mine))
+        if solo:
+            D["solo"] = True
+        self._duel_start(uids, names)
+
     # ---- window
     DUEL_SCALE = 4                                   # screen px per art px
 
@@ -4822,6 +4910,9 @@ class Overlay:
         info = tk.Label(win, text="", bg=BG, fg=MUTED, font=F(),
                         wraplength=w, justify="center", height=3)
         info.pack(padx=10)
+        rematch = tk.Button(win, text="Rematch", command=self._duel_rematch,
+                            state="disabled")
+        rematch.pack(pady=(0, 4))
         row = tk.Frame(win, bg=BG)
         row.pack(pady=(8, 2))
         btns = {}
@@ -4871,7 +4962,8 @@ class Overlay:
         D["win"] = win
         D["ui"] = {"cv": cv, "status": status, "info": info,
                    "btns": btns, "direction_buttons": direction_buttons,
-                   "movement_buttons": movement_buttons, "help": helpl}
+                   "movement_buttons": movement_buttons, "help": helpl,
+                   "rematch": rematch}
         D["fx"] = DuelFx(int(D["gid"], 16) & 0xFFFF)
         D["phase"], D["stage"], D["bg_off"] = 0, None, (0, 0)
         D["frame"], D["goal"] = duel_frame(D["S"]), None
@@ -5052,15 +5144,15 @@ class Overlay:
                            fill=DUEL_COLS[i], font=font, tags="fg",
                            anchor="nw" if i == 0 else "ne")
         perspective = 0 if D.get("solo") else D["me"]
-        advantage = duel_frame_lead(D["S"], perspective)
+        advantage = duel_turn_lead(D["S"], perspective)
         if advantage > 0:
-            lead_text = f"+{advantage} frames"
+            lead_text = f"+{advantage} turns"
             lead_color = "#7be08a"
         elif advantage < 0:
-            lead_text = f"{advantage} frames"
+            lead_text = f"{advantage} turns"
             lead_color = "#ff7a7a"
         else:
-            lead_text, lead_color = "0 frames", MUTED
+            lead_text, lead_color = "0 turns", MUTED
         if D.get("solo") and advantage:
             lead_text = f"{D['names'][perspective]} {lead_text}"
         cv.create_text((DUEL_LW // 2 + ox) * sc, (4 + oy) * sc,
@@ -5261,6 +5353,7 @@ class Overlay:
             return
         D["over"] = True
         D["anim"] = False                    # let the idle loop paint the end
+        D["rematch_state"] = "ready"
         D["over_at"] = time.time()           # keep resending a little longer
         if winner in (0, 1):
             D["goal"] = (winner, 1 - winner)  # the flashing GO arrow
@@ -5279,7 +5372,11 @@ class Overlay:
                 text=text, fg=(DUEL_COLS[winner] if D.get("solo") and winner != -1
                                else "#7be08a" if winner == D["me"]
                                else "#ff7a7a" if winner != -1 else FG))
-            ui["info"].config(text=D["last"] + "\nClose this window when done.")
+            ui["info"].config(text=D["last"] +
+                              "\nRematch or close this window when done.")
+            ui["rematch"].config(
+                state="normal", text="Rematch" if not D.get("solo")
+                else "Play again")
             self._duel_buttons(False)
         if D["mine"] and not D.get("solo"):          # the host tells the room
             hp = [p["hp"] for p in D["S"]["p"]] if D["S"] else [0, 0]

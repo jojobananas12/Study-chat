@@ -252,7 +252,7 @@ class DuelProtocolTests(unittest.TestCase):
         chat.duel_round(state, {0: "wait"})
         self.assertEqual(state["p"][1]["stun"], 0)
 
-    def test_frame_advantage_draws_signed_and_centered_between_healthbars(self):
+    def test_turn_advantage_draws_signed_and_centered_between_healthbars(self):
         state = chat.duel_new()
         state["p"][1]["stun"] = 1
         overlay = chat.Overlay.__new__(chat.Overlay)
@@ -272,7 +272,7 @@ class DuelProtocolTests(unittest.TestCase):
             overlay._duel_draw(frame)
 
         indicator = next(call for call in canvas.create_text.call_args_list
-                         if call.kwargs.get("text") == "+8 frames")
+                         if call.kwargs.get("text") == "+1 turns")
         self.assertEqual(indicator.args, (400, 16))
         self.assertEqual(indicator.kwargs["fill"], "#7be08a")
         self.assertEqual(indicator.kwargs["anchor"], "n")
@@ -285,7 +285,7 @@ class DuelProtocolTests(unittest.TestCase):
             overlay._duel_draw(frame)
 
         indicator = next(call for call in canvas.create_text.call_args_list
-                         if call.kwargs.get("text") == "-8 frames")
+                         if call.kwargs.get("text") == "-1 turns")
         self.assertEqual(indicator.kwargs["fill"], "#ff7a7a")
 
     def test_failed_grab_costs_three_turns_for_grabber(self):
@@ -482,6 +482,102 @@ class DuelHandshakeTests(unittest.TestCase):
 
         guest._duel_start.assert_not_called()
         guest._duel_over.assert_called_once_with()
+
+
+class DuelRematchTests(unittest.TestCase):
+    def overlay(self, mine, uid, rematch_state="ready"):
+        ov = chat.Overlay.__new__(chat.Overlay)
+        ov.net = Mock()
+        ov.net.uid, ov.net.name = uid, "Player"
+        ov.root = Mock()
+        ov.duel = {
+            "gid": "0123456789ab", "host_uid": "host", "host": "Host",
+            "mine": mine, "state": "playing", "over": True,
+            "uids": ["host", "guest"], "names": ["Host", "Guest"],
+            "me": 0 if uid == "host" else 1,
+            "rematch_state": rematch_state, "ui": None, "solo": False,
+        }
+        ov._duel_send = Mock()
+        ov._duel_begin_rematch = Mock()
+        ov._duel_restart = Mock()
+        return ov
+
+    def test_rematch_button_sends_request_and_waits_for_acceptance(self):
+        host = self.overlay(True, "host")
+
+        host._duel_rematch()
+
+        host._duel_send.assert_called_once_with({"op": "rematch"})
+        self.assertEqual(host.duel["rematch_state"], "waiting")
+
+    def test_host_accepting_guest_request_starts_the_rematch(self):
+        host = self.overlay(True, "host")
+        message = {"uid": "guest", "name": "Guest",
+                   "duel": {"op": "rematch", "gid": "0123456789ab"}}
+
+        with patch("tkinter.messagebox.askyesno", return_value=True):
+            host._duel_msg(message)
+
+        host._duel_begin_rematch.assert_called_once_with()
+
+    def test_guest_acceptance_starts_host_initiated_rematch(self):
+        host = self.overlay(True, "host", "waiting")
+        message = {"uid": "guest", "name": "Guest",
+                   "duel": {"op": "rematch_accept", "gid": "0123456789ab"}}
+
+        host._duel_msg(message)
+
+        host._duel_begin_rematch.assert_called_once_with()
+
+    def test_rematch_start_uses_a_new_id_and_targets_the_opponent(self):
+        host = self.overlay(True, "host")
+        host._duel_begin_rematch = chat.Overlay._duel_begin_rematch.__get__(
+            host)
+        with patch.object(chat.uuid, "uuid4") as uuid4:
+            uuid4.return_value.hex = "abcdef0123456789"
+
+            host._duel_begin_rematch()
+
+        host._duel_send.assert_called_once_with({
+            "op": "rematch_start", "p2": "guest", "ngid": "abcdef012345",
+        })
+        host._duel_restart.assert_called_once_with("abcdef012345")
+
+    def test_guest_starts_only_after_valid_host_rematch_start(self):
+        guest = self.overlay(False, "guest", "accepting")
+        message = {
+            "uid": "host", "name": "Host",
+            "duel": {"op": "rematch_start", "gid": "0123456789ab",
+                     "p2": "guest", "ngid": "abcdef012345"},
+        }
+
+        guest._duel_msg(message)
+
+        guest._duel_restart.assert_called_once_with("abcdef012345")
+
+    def test_guest_requester_starts_after_host_accepts(self):
+        guest = self.overlay(False, "guest", "waiting")
+        message = {
+            "uid": "host", "name": "Host",
+            "duel": {"op": "rematch_start", "gid": "0123456789ab",
+                     "p2": "guest", "ngid": "abcdef012345"},
+        }
+
+        guest._duel_msg(message)
+
+        guest._duel_restart.assert_called_once_with("abcdef012345")
+
+    def test_guest_ignores_rematch_start_for_another_player(self):
+        guest = self.overlay(False, "guest", "accepting")
+        message = {
+            "uid": "host", "name": "Host",
+            "duel": {"op": "rematch_start", "gid": "0123456789ab",
+                     "p2": "someone-else", "ngid": "abcdef012345"},
+        }
+
+        guest._duel_msg(message)
+
+        guest._duel_restart.assert_not_called()
 
 
 class DuelStatusTests(unittest.TestCase):
