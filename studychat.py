@@ -67,8 +67,10 @@ Images:
   - Press Ctrl+V in the text box to send an image from your clipboard
     (screenshots work great), or click "+" to pick an image file,
     or type  /img path/to/file.png
-  - The skull button (next to "+") sends the GIF called skeleton-skyrim that
-    sits in the same folder as studychat.py.
+  - The skull button (next to "+") opens the GIF called skeleton-skyrim
+    (from the same folder as studychat.py) in a window on EVERYONE'S screen.
+    It closes itself after a few seconds, or on a click. You can turn it off
+    for yourself in Settings ("Let others open the skeleton window").
   - GIFs keep moving: send one with "+" or  /img path/to/file.gif , or with
     a direct link:  /gif https://example.com/funny.gif  (right-click a GIF
     and "copy image address"). Only the newest few GIFs animate.
@@ -117,7 +119,7 @@ except Exception:
 # ------------------------------------------------------------------ version
 # Bump VERSION whenever you publish a new studychat.py to GitHub. Everyone
 # running an older version is told, and can update with one click.
-VERSION = "1.7"
+VERSION = "1.8"
 UPDATE_REPO = "jojobananas12/Study-chat"     # github.com/<this>
 CHECK_UPDATES = os.environ.get("STUDYCHAT_NO_UPDATE") != "1"
 
@@ -169,6 +171,8 @@ THUMB_W, THUMB_H = 280, 180
 MAX_IMAGE_MB = 8         # biggest image allowed, in megabytes
 SEND_MAX_DIM = 1600      # big images are shrunk to this many pixels first
 ALLOW_FLIP = 1           # 1 = others can flip your chat upside down, 0 = no
+ALLOW_SKELETON = 1       # 1 = others can open the skeleton window on your screen
+SKELETON_SECONDS = 10    # that window closes itself after this many seconds
 GIF_SECONDS = 4          # length of a "gif of the reel" recording
 GIF_FPS = 8              # frames per second of that recording
 GIF_WIDTH = 300          # width (pixels) of that GIF
@@ -212,6 +216,11 @@ SPEC = [
     ("Behavior", "MAX_HISTORY", "Messages remembered", "int", 20, 2000),
     ("Behavior", "ALLOW_FLIP", "Let others flip your chat (1 = yes, 0 = no)",
      "int", 0, 1),
+    ("Behavior", "ALLOW_SKELETON",
+     "Let others open the skeleton window on your screen (1 = yes, 0 = no)",
+     "int", 0, 1),
+    ("Behavior", "SKELETON_SECONDS", "Skeleton window closes after (seconds)",
+     "int", 3, 120),
     ("Behavior", "DEFAULT_NAME", "Default name", "str", 0, 20),
     ("Behavior", "DEFAULT_ROOM", "Default room", "str", 1, 60),
     ("Behavior", "FONT_SYNC",
@@ -911,7 +920,7 @@ class Net:
             self.closed = True
             self.send("left", kind="leave")
 
-    def send_image(self, data):
+    def send_image(self, data, extra=None):
         mid = uuid.uuid4().hex
         self.images[mid] = data
         while len(self.images) > 20:          # keep only the latest few
@@ -919,6 +928,8 @@ class Net:
         msg = {"app": "studychat", "room": self.room, "id": mid,
                "name": self.name, "text": "", "type": "img",
                "port": self.img_port, "size": len(data)}
+        if extra:
+            msg.update(extra)
         self.seen.add(mid)
         self._broadcast(msg)
         return dict(msg, data=data)
@@ -1091,10 +1102,12 @@ class RelayNet:
         self.sendq.put((msg, None))
         return msg
 
-    def send_image(self, data):
+    def send_image(self, data, extra=None):
         msg = {"app": "studychat", "room": self.room, "id": uuid.uuid4().hex,
                "name": self.name, "text": "", "type": "img",
                "size": len(data)}
+        if extra:
+            msg.update(extra)
         self.seen.add(msg["id"])
         self.sendq.put((msg, data))
         return dict(msg, data=data)
@@ -2665,7 +2678,7 @@ class Overlay:
         return self.tk.PhotoImage(master=self.root,
                                   data=base64.b64encode(b.getvalue()))
 
-    def make_anim(self, data, max_w, max_h):
+    def make_anim(self, data, max_w, max_h, stream=False):
         """Frames for an animated GIF, or None if it isn't animated."""
         if not data.startswith(b"GIF8"):
             return None
@@ -2674,6 +2687,14 @@ class Overlay:
             if PIL_OK:
                 im = Image.open(io.BytesIO(data))
                 n = getattr(im, "n_frames", 1)
+                if n > MAX_GIF_FRAMES and stream and ImageTk is not None:
+                    # a long GIF: decode one frame at a time while it plays
+                    first = im.convert("RGBA")
+                    first.thumbnail((max_w, max_h))
+                    return {"disp": ImageTk.PhotoImage(first), "stream": im,
+                            "n": n, "size": first.size, "i": 0,
+                            "next": time.time() + max(
+                                20, int(im.info.get("duration", 100))) / 1000}
                 if n < 2 or n > MAX_GIF_FRAMES:
                     return None
                 for k in range(n):
@@ -2710,18 +2731,32 @@ class Overlay:
             log("make_anim failed: " + traceback.format_exc())
             return None
 
+    def _step_anim(self, a, now):
+        if now < a["next"]:
+            return
+        if a.get("stream"):                      # long GIF: next frame on demand
+            a["i"] = (a["i"] + 1) % a["n"]
+            im = a["stream"]
+            im.seek(a["i"])
+            fr = im.convert("RGBA")
+            fr.thumbnail(a["size"])
+            a["disp"].paste(fr)
+            a["next"] = now + max(20, int(im.info.get("duration", 100))) / 1000
+            return
+        a["i"] = (a["i"] + 1) % len(a["frames"])
+        self.root.tk.call(str(a["disp"]), "copy", str(a["frames"][a["i"]]))
+        a["next"] = now + a["delays"][a["i"]] / 1000
+
     def _animate(self):
         try:
             now = time.time()
+            self.full_anims[:] = [a for a in self.full_anims
+                                  if a["widget"].winfo_exists()]
+            for a in self.full_anims:            # viewer windows always play
+                self._step_anim(a, now)
             if self.state != "collapsed":
-                self.full_anims[:] = [a for a in self.full_anims
-                                      if a["widget"].winfo_exists()]
-                for a in self.anims + self.full_anims:
-                    if now >= a["next"]:
-                        a["i"] = (a["i"] + 1) % len(a["frames"])
-                        self.root.tk.call(str(a["disp"]), "copy",
-                                          str(a["frames"][a["i"]]))
-                        a["next"] = now + a["delays"][a["i"]] / 1000
+                for a in self.anims:
+                    self._step_anim(a, now)
         except Exception:
             log("animate failed: " + traceback.format_exc())
         finally:
@@ -2743,15 +2778,17 @@ class Overlay:
         except Exception:
             return None
 
-    def open_full(self, data):
+    def open_full(self, data, title="Image", stream=False, focus=True,
+                  seconds=0, center=False):
         sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
-        anim = self.make_anim(data, int(sw * 0.8), int(sh * 0.8))
+        anim = self.make_anim(data, int(sw * 0.8), int(sh * 0.8),
+                              stream=stream)
         photo = anim["disp"] if anim else self.make_photo(
             data, int(sw * 0.8), int(sh * 0.8))
         if photo is None:
             return
         top = self.tk.Toplevel(self.root)
-        top.title("Image")
+        top.title(title)
         top.configure(bg=BG)
         top.attributes("-topmost", True)
         lbl = self.tk.Label(top, image=photo, bg=BG, cursor="hand2")
@@ -2761,16 +2798,28 @@ class Overlay:
             anim["widget"] = lbl
             self.full_anims.append(anim)
 
-        def close(_e=None):
-            top.destroy()
-            self._focus_entry()
+        def close(_e=None, refocus=True):
+            try:
+                top.destroy()
+            except Exception:
+                return "break"
+            if refocus:
+                self._focus_entry()
             return "break"
 
         for w in (top, lbl):
             w.bind("<Button-1>", close)
         top.bind("<Escape>", close)
         top.protocol("WM_DELETE_WINDOW", close)
-        top.focus_force()
+        if center:
+            top.update_idletasks()
+            top.geometry(f"+{max(0, (sw - top.winfo_reqwidth()) // 2)}"
+                         f"+{max(0, (sh - top.winfo_reqheight()) // 3)}")
+        if seconds:                          # closes itself; never grabs focus
+            top.after(int(seconds * 1000), lambda: close(refocus=False))
+        if focus:
+            top.focus_force()
+        return top
 
     def push_image(self, data):
         msg = self.net.send_image(data)
@@ -2839,38 +2888,69 @@ class Overlay:
         self.push_image(data)
         return True
 
-    def send_skeleton(self):
-        """The skull button: send "skeleton-skyrim" from this script's folder."""
-        now = time.time()
-        if now - getattr(self, "_skull_at", 0) < 1.5:
-            return                           # ignore double clicks
-        self._skull_at = now
+    def _find_skeleton(self):
+        """The skeleton-skyrim file next to this script, or None."""
         folder = os.path.dirname(os.path.abspath(__file__))
-        path = None
         try:
             names = os.listdir(folder)
         except OSError:
-            names = []
-        # prefer .gif, but accept the name with any extension (or none)
+            return None
         for want in ("skeleton-skyrim.gif", "skeleton-skyrim"):
             for n in names:
                 if n.lower() == want:
-                    path = os.path.join(folder, n)
-                    break
-            if path:
-                break
-        if path is None:
-            for n in sorted(names):
-                if n.lower().startswith("skeleton-skyrim."):
-                    path = os.path.join(folder, n)
-                    break
+                    return os.path.join(folder, n)
+        for n in sorted(names):
+            if n.lower().startswith("skeleton-skyrim."):
+                return os.path.join(folder, n)
+        return None
+
+    def open_skeleton(self, data, who=""):
+        """Show the skeleton GIF in a window of its own."""
+        old = getattr(self, "skel_top", None)
+        try:
+            if old is not None and old.winfo_exists():
+                old.destroy()                # one at a time
+        except Exception:
+            pass
+        title = f"{who} sent the skeleton" if who else "Skeleton"
+        self.skel_top = self.open_full(
+            data, title=title, stream=True, focus=False,
+            seconds=SKELETON_SECONDS, center=True)
+
+    def send_skeleton(self):
+        """The skull button: the skeleton GIF opens on everyone's screen."""
+        now = time.time()
+        if now - getattr(self, "_skull_at", 0) < 6:
+            if now - getattr(self, "_skull_at", 0) > 1.5:
+                self.note("wait a few seconds before sending the skeleton "
+                          "again")
+            return
+        path = self._find_skeleton()
         if path is None:
             self.note("couldn't find skeleton-skyrim.gif in the same folder "
                       "as studychat.py")
-        else:
-            self.send_file(path)
+            return
+        try:
+            with open(path, "rb") as f:
+                data = f.read(40 * 1024 * 1024)
+            if not data.startswith(b"GIF8"):
+                raise ValueError("not a GIF")
+            if len(data) > MAX_IMAGE_BYTES:
+                data = shrink_gif(data, MAX_IMAGE_BYTES)
+                if data is None:
+                    self.note("the skeleton GIF is too big to send"
+                              + ("" if PIL_OK else
+                                 " (install Pillow so it can be shrunk)"))
+                    return
+        except Exception:
+            self.note("couldn't read the skeleton GIF (it must be a real "
+                      ".gif file)")
+            return
+        self._skull_at = now
+        self.net.send_image(data, extra={"popup": "skeleton"})
+        self.open_skeleton(data)             # and on your own screen
+        self.note("skeleton sent to everyone")
         self._touch()
-        self._focus_entry()
 
     def send_gif_link(self, url):
         """/gif <direct link to a .gif file>"""
@@ -3827,6 +3907,15 @@ class Overlay:
                                f"(you have v{VERSION}). Click \"update\" in "
                                "the top bar or type /update."})
             return
+        if (msg.get("type") == "img" and msg.get("popup") == "skeleton"
+                and isinstance(msg.get("data"), bytes)):
+            now = time.time()
+            if (ALLOW_SKELETON and msg["data"].startswith(b"GIF8")
+                    and now - getattr(self, "_skel_shown", 0) > 10):
+                self._skel_shown = now
+                self.open_skeleton(msg["data"],
+                                   str(msg.get("name", "?"))[:20])
+            return                           # not added to the chat
         if msg.get("type") == "gif_ready":
             self.send_gif(msg["data"])
             return
