@@ -67,6 +67,8 @@ Images:
   - Press Ctrl+V in the text box to send an image from your clipboard
     (screenshots work great), or click "+" to pick an image file,
     or type  /img path/to/file.png
+  - The skull button (next to "+") sends the GIF called skeleton-skyrim that
+    sits in the same folder as studychat.py.
   - GIFs keep moving: send one with "+" or  /img path/to/file.gif , or with
     a direct link:  /gif https://example.com/funny.gif  (right-click a GIF
     and "copy image address"). Only the newest few GIFs animate.
@@ -115,7 +117,7 @@ except Exception:
 # ------------------------------------------------------------------ version
 # Bump VERSION whenever you publish a new studychat.py to GitHub. Everyone
 # running an older version is told, and can update with one click.
-VERSION = "1.6"
+VERSION = "1.7"
 UPDATE_REPO = "jojobananas12/Study-chat"     # github.com/<this>
 CHECK_UPDATES = os.environ.get("STUDYCHAT_NO_UPDATE") != "1"
 
@@ -1697,6 +1699,13 @@ class Overlay:
                              cursor="hand2", font=F(3, True))
         self.plus.pack(side="right", padx=8)
         self.plus.bind("<Button-1>", lambda e: self.pick_image())
+        # skull button: sends the skeleton-skyrim GIF that sits next to this
+        # script. (A plain skull-and-crossbones sign, not an emoji: old Macs'
+        # Tk crashes on emoji.)
+        self.skull = tk.Label(self.entry_wrap, text="\u2620", bg=BAR, fg=FG,
+                              cursor="hand2", font=F(3, True))
+        self.skull.pack(side="right", padx=(0, 2))
+        self.skull.bind("<Button-1>", lambda e: self.send_skeleton())
         self.entry = tk.Entry(self.entry_wrap, bg=BAR, fg=FG, bd=0,
                               insertbackground=FG, font=F(),
                               highlightthickness=0)
@@ -1952,6 +1961,7 @@ class Overlay:
         self.text.tag_config("link", foreground=LINK_COLOR, underline=True)
         self.entry_wrap.config(bg=BAR)
         self.plus.config(bg=BAR, fg=FG, font=F(3, True))
+        self.skull.config(bg=BAR, fg=FG, font=F(3, True))
         self.entry.config(bg=BAR, fg=FG, insertbackground=FG, font=F())
         for tag, (fam, bold, color) in self.font_tags.items():
             self._config_tag(tag, fam, bold, color)
@@ -2828,6 +2838,39 @@ class Overlay:
             return False
         self.push_image(data)
         return True
+
+    def send_skeleton(self):
+        """The skull button: send "skeleton-skyrim" from this script's folder."""
+        now = time.time()
+        if now - getattr(self, "_skull_at", 0) < 1.5:
+            return                           # ignore double clicks
+        self._skull_at = now
+        folder = os.path.dirname(os.path.abspath(__file__))
+        path = None
+        try:
+            names = os.listdir(folder)
+        except OSError:
+            names = []
+        # prefer .gif, but accept the name with any extension (or none)
+        for want in ("skeleton-skyrim.gif", "skeleton-skyrim"):
+            for n in names:
+                if n.lower() == want:
+                    path = os.path.join(folder, n)
+                    break
+            if path:
+                break
+        if path is None:
+            for n in sorted(names):
+                if n.lower().startswith("skeleton-skyrim."):
+                    path = os.path.join(folder, n)
+                    break
+        if path is None:
+            self.note("couldn't find skeleton-skyrim.gif in the same folder "
+                      "as studychat.py")
+        else:
+            self.send_file(path)
+        self._touch()
+        self._focus_entry()
 
     def send_gif_link(self, url):
         """/gif <direct link to a .gif file>"""
