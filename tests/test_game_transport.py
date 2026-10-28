@@ -838,22 +838,23 @@ class NumberGuesserOutcomeTests(unittest.TestCase):
             }
         return ov
 
-    def test_wrong_guess_eliminates_player_without_quitting_chat(self):
+    def test_wrong_guess_closes_the_program_after_a_brief_notice(self):
         ov = self.make_overlay()
 
         ov._game_result_ui(True, False, "Player", 4, None)
 
         text = ov.game["ui"]["title"].config.call_args.kwargs["text"]
-        self.assertIn("out for this round", text)
+        self.assertIn("Study Chat will now close", text)
         ov.root.after.assert_called_once()
-        self.assertEqual(ov.root.after.call_args.args[0], 5000)
+        self.assertEqual(ov.root.after.call_args.args,
+                         (3000, ov.disconnect))
 
-    def test_wrong_result_after_popup_was_closed_does_not_quit_chat(self):
+    def test_wrong_result_after_popup_was_closed_still_closes_program(self):
         ov = self.make_overlay(with_ui=False)
 
         ov._game_result_ui(True, False, "Player", 4, None)
 
-        ov.root.after.assert_not_called()
+        ov.root.after.assert_called_once_with(3000, ov.disconnect)
 
     def test_another_players_wrong_guess_does_not_close_my_popup(self):
         ov = self.make_overlay()
@@ -882,6 +883,48 @@ class NumberGuesserOutcomeTests(unittest.TestCase):
         result = ov.net.send.call_args.kwargs["extra"]["game"]
         self.assertFalse(result["ok"])
         self.assertNotIn("secret", result)
+
+    def test_only_my_confirmed_wrong_guess_marks_my_game_over(self):
+        ov = chat.Overlay.__new__(chat.Overlay)
+        ov.game = {
+            "gid": "0123456789ab", "host_uid": "host", "mine": False,
+            "max": 10, "my_guess": 4, "over": False,
+        }
+        ov.net = Mock()
+        ov.net.uid = "guesser"
+        ov._game_announce = Mock()
+        ov._game_result_ui = Mock()
+
+        ov._game_msg({
+            "uid": "host", "name": "Host",
+            "game": {"op": "result", "gid": "0123456789ab",
+                     "guid": "guesser", "gname": "Guesser",
+                     "n": 4, "ok": False},
+        })
+
+        self.assertTrue(ov.game["over"])
+        ov._game_result_ui.assert_called_once_with(
+            True, False, "Guesser", 4, None)
+
+    def test_inconsistent_success_result_is_ignored(self):
+        ov = chat.Overlay.__new__(chat.Overlay)
+        ov.game = {
+            "gid": "0123456789ab", "host_uid": "host", "mine": False,
+            "max": 10, "my_guess": 4, "over": False,
+        }
+        ov.net = Mock()
+        ov.net.uid = "guesser"
+        ov._game_announce = Mock()
+        ov._game_result_ui = Mock()
+
+        ov._game_msg({
+            "uid": "host", "name": "Host",
+            "game": {"op": "result", "gid": "0123456789ab",
+                     "guid": "guesser", "n": 4, "ok": True, "secret": 5},
+        })
+
+        self.assertFalse(ov.game["over"])
+        ov._game_result_ui.assert_not_called()
 
 
 class SharedFontFolderTests(unittest.TestCase):
