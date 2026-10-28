@@ -286,6 +286,45 @@ class OverlayTests(unittest.TestCase):
             self.assertEqual((ov.anchor_x, ov.anchor_bottom), (20, 970))
 
 
+class SettingsWindowCloseTests(unittest.TestCase):
+    def window(self):
+        settings = chat.SettingsWindow.__new__(chat.SettingsWindow)
+        settings.snapshot = {"FONT_SIZE": 16}
+        settings.job = None
+        settings.closed = False
+        settings.win = Mock()
+        settings.ov = Mock()
+        settings.ov.settings_win = settings
+        settings.ov.busy = True
+        return settings
+
+    def test_cancel_closes_before_restoring_preview(self):
+        settings = self.window()
+        order = []
+        settings.close = Mock(side_effect=lambda: order.append("close"))
+        settings.ov.apply_settings.side_effect = (
+            lambda: order.append("apply"))
+
+        with patch.object(chat, "set_value",
+                          side_effect=lambda *args: order.append("restore")), \
+                patch.object(chat, "log"):
+            chat.SettingsWindow.cancel(settings)
+
+        self.assertEqual(order, ["close", "restore", "apply"])
+
+    def test_cancel_stays_closed_if_preview_restore_fails(self):
+        settings = self.window()
+
+        with patch.object(chat, "set_value",
+                          side_effect=RuntimeError("preview failure")), \
+                patch.object(chat, "log"):
+            chat.SettingsWindow.cancel(settings)
+
+        settings.win.destroy.assert_called_once_with()
+        self.assertIsNone(settings.ov.settings_win)
+        self.assertFalse(settings.ov.busy)
+
+
 class SettingsTests(unittest.TestCase):
     def test_old_position_keys_are_ignored_and_other_preferences_survive(self):
         with tempfile.TemporaryDirectory() as directory, \

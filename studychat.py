@@ -2337,13 +2337,15 @@ class SettingsWindow:
         self._load_all(DEFAULTS)
 
     def cancel(self):
+        snapshot = dict(self.snapshot)
+        self.close()
         try:
-            self._load_all(self.snapshot)
+            for key, value in snapshot.items():
+                set_value(key, value)
+            self.ov.apply_settings()
         except Exception:
             log("couldn't restore settings while closing: "
                 + traceback.format_exc())
-        finally:
-            self.close()
 
     def save(self):
         try:
