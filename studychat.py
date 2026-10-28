@@ -114,7 +114,7 @@ except Exception:
 # ------------------------------------------------------------------ version
 # Bump VERSION whenever you publish a new studychat.py to GitHub. Everyone
 # running an older version is told, and can update with one click.
-VERSION = "1.5"
+VERSION = "1.6"
 UPDATE_REPO = "jojobananas12/Study-chat"     # github.com/<this>
 CHECK_UPDATES = os.environ.get("STUDYCHAT_NO_UPDATE") != "1"
 
@@ -1391,6 +1391,7 @@ class Overlay:
         self.seen_upto = 0                  # ...and how many you've seen
         self.last_activity = 0
         self.busy = False
+        self.menu_until = 0                 # a popup menu is open until then
         self.settings_win = None
         self._focus_job = None
         self.font_tags = {}                 # text tag -> (family, bold, color)
@@ -1545,7 +1546,7 @@ class Overlay:
         self._reset_anchor()
         self._placed_geometry = None
         self._geometry(fit=True)
-        self.root.lift()
+        self._raise_chat()
         self._focus_entry()
 
     def _check_displays(self):
@@ -1622,7 +1623,7 @@ class Overlay:
             self._geometry()
             self.redraw()
             self._touch()
-            self.root.lift()
+            self._raise_chat()
             self._focus_entry()
 
     # ---- upside-down ("flip") layout
@@ -1671,9 +1672,67 @@ class Overlay:
         except Exception:
             log("flip restyle failed: " + traceback.format_exc())
 
+    # ---- keeping popups above the chat
+    # The chat re-asserts "always on top" every couple of seconds so other
+    # apps can't bury it. That also lifted it over its own popup menu and
+    # windows (settings, image viewer), hiding them behind the chat. So the
+    # refresh now pauses while a menu is open, and any window the chat opened
+    # is put back above it afterwards.
+    def _menu_open(self):
+        return time.time() < self.menu_until
+
+    def _menu_closed(self, _e=None):
+        self.menu_until = 0
+
+    def _post_menu(self, menu, x, y):
+        """Show a popup menu without letting the chat cover it."""
+        self.menu_until = time.time() + 120         # safety net
+        menu.bind("<Unmap>", self._menu_closed)     # fires when it closes
+        try:
+            menu.tk_popup(x, y)
+        finally:
+            menu.grab_release()
+            if sys.platform in ("win32", "darwin"):  # these wait for it
+                self._menu_closed()
+
+    def _child_windows(self):
+        """Windows opened by the chat (settings, image viewer...) now showing."""
+        out = []
+        for w in self.root.winfo_children():
+            if isinstance(w, self.tk.Toplevel):
+                try:
+                    if w.winfo_viewable():
+                        out.append(w)
+                except Exception:
+                    pass
+        return out
+
+    def _raise_chat(self):
+        """Bring the chat forward, with its own windows still on top of it."""
+        if self._menu_open():
+            return
+        self.root.lift()
+        for w in self._child_windows():
+            try:
+                w.lift()
+            except Exception:
+                pass
+
+    def _stay_on_top(self):
+        """The periodic "stay above other apps" refresh."""
+        if self._menu_open():
+            return                       # don't cover an open menu
+        self.root.attributes("-topmost", True)
+        for w in self._child_windows():  # ...and keep our windows above it
+            try:
+                w.attributes("-topmost", True)
+                w.lift()
+            except Exception:
+                pass
+
     def _focus_entry(self, _e=None):
         """Restore typing after geometry and default mouse bindings finish."""
-        if self.state != "active" or self.busy:
+        if self.state != "active" or self.busy or self._menu_open():
             return
         self._touch()
         if self._focus_job is not None:
@@ -1683,7 +1742,7 @@ class Overlay:
     def _restore_entry_focus(self):
         self._focus_job = None
         if (self.state == "active" and not self.busy
-                and self.entry.winfo_viewable()):
+                and not self._menu_open() and self.entry.winfo_viewable()):
             self.entry.focus_force()
 
     def apply_settings(self):
@@ -2265,9 +2324,8 @@ class Overlay:
         self._fill_menu(menu)
         self.busy = True                     # keep the chat open meanwhile
         try:
-            menu.tk_popup(x, y)
+            self._post_menu(menu, x, y)
         finally:
-            menu.grab_release()
             self.busy = self.settings_win is not None
             self._touch()
 
@@ -2356,9 +2414,8 @@ class Overlay:
             return "break"
         self.busy = True                     # keep the chat open meanwhile
         try:
-            menu.tk_popup(e.x_root, e.y_root)
+            self._post_menu(menu, e.x_root, e.y_root)
         finally:
-            menu.grab_release()
             self.busy = self.settings_win is not None
             self._touch()
         return "break"
@@ -2609,7 +2666,7 @@ class Overlay:
             self._touch()
         if path:
             self.send_file(path)
-        self.root.lift()
+        self._raise_chat()
         self._focus_entry()
 
     def _clip_text(self):
@@ -3142,13 +3199,14 @@ class Overlay:
             if self.state == "popup" and now > self.popup_until:
                 self.set_state("collapsed")
             elif (self.state == "active" and not self.busy and not self._dragging
-                  and not self.entry.get()
+                  and not self._menu_open() and not self.entry.get()
                   and now - self.last_activity > ACTIVE_IDLE_SECONDS):
                 self.set_state("collapsed")
-            # keep sitting above other windows (every couple of seconds)
+            # keep sitting above other windows (every couple of seconds),
+            # but never above the chat's own menu or windows
             self.tick_n += 1
             if self.tick_n % 4 == 0:
-                self.root.attributes("-topmost", True)
+                self._stay_on_top()
                 self._check_displays()
         except Exception:
             log("tick failed: " + traceback.format_exc())
