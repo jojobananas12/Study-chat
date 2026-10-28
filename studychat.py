@@ -50,6 +50,21 @@ School wifi:
     must pick the same mode. Online mode is NOT private, so use a long,
     hard-to-guess room name.
 
+Online games:
+  - Both players need this version for online Duel. Combat choices and
+    animation stay local; the relay carries three messages per shared turn.
+  - Sends use a local request budget and respect relay throttling responses.
+    Other devices on the same public IP may share ntfy's actual allowance;
+    the number of people in the room does not change the local budget.
+  - Failed sends can be retried with /retry or the game's Retry send button.
+    A locked move never changes during retries. Interrupted duels can be
+    cancelled without a result.
+  - A confirmed daily quota limit pauses publishing until midnight UTC.
+    Local usage counts (not remaining quota) are stored in .studychat-net-*.json
+    in your home folder. No messages or tokens are stored there.
+  - Network settings include burst, refill interval and daily usage warning
+    allowance for custom relays. A token does not automatically raise limits.
+
 Links in messages are clickable (Instagram links open the small reels
   window). Select chat text with the mouse and press Ctrl+C (Cmd+C on a
   Mac) to copy it, or right-click a line or link for a copy menu.
@@ -59,6 +74,8 @@ Commands: /disconnect (or /quit), /getfonts (install the free fonts your friends
   /reels [link] (small Instagram window; needs Chrome, Chromium,
   Edge or Brave, or pywebview), /reelgif (send a GIF of the reel; same as
   the "gif" button, "/reelgif area" picks the screen area again),
+  /duel (challenge the room to a tiny fighting game),
+  /retry (retry failed online sends without changing locked game choices),
   /who (who's online), /update (check for a new version),
   /version, /settings, /img, /quit. The chat checks GitHub for a newer
   version when it starts; set STUDYCHAT_NO_UPDATE=1 to turn that off.
@@ -86,6 +103,7 @@ import hashlib
 import struct
 import io
 import json
+import math
 import os
 import queue
 import shutil
@@ -182,6 +200,9 @@ PORT = 50555             # same-wifi mode (everyone must match)
 RELAY_URL = "https://ntfy.sh"   # online mode
 WIFI_PING_EVERY = 20     # seconds between "I'm still here" signals
 ONLINE_PING_EVERY = 240
+RELAY_BURST = 60         # local upper bound; the server enforces shared-IP limits
+RELAY_REFILL_SECONDS = 5 # one request per interval, independent of room membership
+RELAY_DAILY_LIMIT = 250  # usage warning only; the server enforces its real quota
 
 PALETTE = ["#5aa9ff", "#ff7a7a", "#7be08a", "#ffd166", "#c792ea",
            "#4dd0e1", "#ffab70", "#f48fb1"]
@@ -241,6 +262,13 @@ SPEC = [
      "int", 15, 300),
 ]
 SPEC_BY_KEY = {s[1]: s for s in SPEC}
+SPEC += [
+    ("Network", "RELAY_BURST", "Relay working request burst", "int", 1, 60),
+    ("Network", "RELAY_REFILL_SECONDS", "Relay request refill (seconds)",
+     "float", 0.1, 60),
+    ("Network", "RELAY_DAILY_LIMIT", "Relay daily allowance (usage warning)",
+     "int", 1, 100000),
+]
 DEFAULTS = {s[1]: globals()[s[1]] for s in SPEC}
 SETTINGS_PATH = os.path.join(os.path.expanduser("~"), ".studychat.json")
 
@@ -814,10 +842,667 @@ def shrink_gif(data, limit):
     return None
 
 
+# ------------------------------------------------------------------ duel
+# A tiny fighting game, as a pure integer simulation. The same two choices
+# always give the same fight on every laptop, so players only exchange
+# their choices. Nothing in here touches Tk or the network.
+DUEL_W = 20                  # arena is positions 0..DUEL_W
+DUEL_HP = 100
+DUEL_START = (5, 15)
+DUEL_MAX_ROUND_TICKS = 80
+DUEL_MAX_ROUNDS = 50
+
+# su = start-up ticks, act = active ticks, rec = recovery ticks.
+# dmg/hs (hit-stun)/push apply on a hit; chip/pen apply when blocked.
+DUEL_MOVES = {
+    "jab":     dict(kind="strike", su=3, act=2, rec=4, reach=3, dmg=8,
+                    hs=7, push=1, chip=0, pen=2,
+                    help="fast, short reach. Beats throw and heavy."),
+    "heavy":   dict(kind="strike", su=7, act=3, rec=8, reach=4, dmg=20,
+                    hs=10, push=3, chip=3, pen=6,
+                    help="slow, long reach, big damage."),
+    "throw":   dict(kind="throw", su=5, act=1, rec=9, reach=2, dmg=14,
+                    hs=10, push=2, chip=0, pen=0,
+                    help="beats block. Loses to jab."),
+    "block":   dict(kind="guard", su=1, act=7, rec=3,
+                    help="stops jab and heavy. Loses to throw."),
+    "advance": dict(kind="walk", dir=1, steps=4, su=0, act=0, rec=2,
+                    help="step 4 toward them."),
+    "retreat": dict(kind="walk", dir=-1, steps=3, su=0, act=0, rec=2,
+                    help="step 3 away."),
+    "wait":    dict(kind="idle", su=0, act=0, rec=3, help="do nothing."),
+}
+DUEL_ORDER = ("jab", "heavy", "throw", "block", "advance", "retreat", "wait")
+
+
+def _total(m):
+    d = DUEL_MOVES[m]
+    return d["su"] + d["act"] + d["rec"] if d["kind"] != "walk" \
+        else d["steps"] + d["rec"]
+
+
+def duel_new():
+    """A fresh fight. Fighter 0 starts on the left."""
+    def fighter(x, f):
+        return {"x": x, "f": f, "hp": DUEL_HP, "move": None, "t": 0,
+                "stun": 0, "done": False}
+    return {"p": [fighter(DUEL_START[0], 1), fighter(DUEL_START[1], -1)],
+            "tick": 0, "round": 0, "over": False, "winner": None}
+
+
+def duel_free(fi):
+    return fi["stun"] == 0 and fi["move"] is None
+
+
+def duel_need(S):
+    """Which fighters must choose now (both only when both are free)."""
+    return [i for i in (0, 1) if duel_free(S["p"][i])]
+
+
+def _guarding(fi, frozen):
+    if frozen or fi["move"] is None:
+        return False
+    d = DUEL_MOVES[fi["move"]]
+    return d["kind"] == "guard" and d["su"] <= fi["t"] < d["su"] + d["act"]
+
+
+def _attacking(fi, frozen):
+    """The attack this fighter makes on this tick, or None."""
+    if frozen or fi["move"] is None or fi["done"]:
+        return None
+    d = DUEL_MOVES[fi["move"]]
+    if d["kind"] in ("strike", "throw") and \
+            d["su"] <= fi["t"] < d["su"] + d["act"]:
+        return d
+    return None
+
+
+def duel_tick(S, ev):
+    """Advance the fight one tick. Appends event strings to ev."""
+    P = S["p"]
+    frozen = [P[i]["stun"] > 0 for i in (0, 1)]
+    for i in (0, 1):
+        if frozen[i]:
+            P[i]["stun"] -= 1
+    # 1. walking, then keep them apart (a step toward the other is
+    #    cancelled if it would make them touch)
+    step = [0, 0]
+    for i in (0, 1):
+        fi = P[i]
+        if frozen[i] or fi["move"] is None:
+            continue
+        d = DUEL_MOVES[fi["move"]]
+        if d["kind"] == "walk" and fi["t"] < d["steps"]:
+            step[i] = d["dir"] * fi["f"]
+    nx = [min(DUEL_W, max(0, P[i]["x"] + step[i])) for i in (0, 1)]
+    if abs(nx[1] - nx[0]) < 1 or (nx[1] - nx[0]) * (P[1]["x"] - P[0]["x"]) <= 0:
+        for i in (0, 1):
+            if step[i] * P[i]["f"] > 0:        # moving toward the other
+                nx[i] = P[i]["x"]
+    for i in (0, 1):
+        P[i]["x"] = nx[i]
+    gap = abs(P[1]["x"] - P[0]["x"])
+    # 2. who hits whom (decided from the state at the start of the tick)
+    att = [_attacking(P[i], frozen[i]) for i in (0, 1)]
+    land = [bool(att[i]) and gap <= att[i]["reach"] for i in (0, 1)]
+    guard = [_guarding(P[i], frozen[i]) for i in (0, 1)]
+    mid_attack = [(not frozen[i]) and P[i]["move"] is not None and
+                  DUEL_MOVES[P[i]["move"]]["kind"] in ("strike", "throw") and
+                  P[i]["t"] < DUEL_MOVES[P[i]["move"]]["su"] + DUEL_MOVES[P[i]["move"]]["act"]
+                  for i in (0, 1)]
+    push = [0, 0]
+    newstun = [None, None]
+    cancel = [False, False]
+    hit = [None, None]
+    for a in (0, 1):
+        if not land[a]:
+            continue
+        d = 1 - a
+        ad = att[a]
+        P[a]["done"] = True
+        if ad["kind"] == "throw" and land[d] and att[d]["kind"] == "throw":
+            ev.append("tech")                     # both threw: nobody lands
+            push[a] += 2
+            push[d] += 2
+            newstun[a] = newstun[d] = 3
+            cancel[a] = cancel[d] = True
+            land[a] = land[d] = False
+            P[d]["done"] = True
+            break
+        if ad["kind"] == "strike" and guard[d]:
+            ev.append("blocked:%d" % d)
+            hit[d] = ("block", ad["chip"])
+            newstun[a] = max(newstun[a] or 0, ad["pen"])
+            push[d] += 1
+            continue
+        dmg = ad["dmg"]
+        if mid_attack[d] and not land[d]:
+            dmg += dmg // 4                       # counter hit
+            ev.append("counter:%d" % d)
+        hit[d] = ("hit", dmg)
+        newstun[d] = ad["hs"]
+        cancel[d] = True
+        push[d] += ad["push"]
+        ev.append("hit:%d:%s" % (d, P[a]["move"]))
+    for i in (0, 1):
+        if hit[i]:
+            P[i]["hp"] = max(0, P[i]["hp"] - hit[i][1])
+        if newstun[i] is not None:
+            P[i]["stun"] = newstun[i]
+        if cancel[i]:
+            P[i]["move"], P[i]["t"], P[i]["done"] = None, 0, False
+    # 3. push-back; whatever a wall absorbs pushes the other fighter back
+    for i in (0, 1):
+        if push[i]:
+            j = 1 - i
+            want = P[i]["x"] - P[i]["f"] * push[i]
+            clamped = min(DUEL_W, max(0, want))
+            extra = abs(want - clamped)
+            P[i]["x"] = clamped
+            if extra:
+                P[j]["x"] = min(DUEL_W, max(0, P[j]["x"] - P[j]["f"] * extra))
+    # 4. moves move on
+    for i in (0, 1):
+        fi = P[i]
+        if frozen[i] or fi["move"] is None:
+            continue
+        fi["t"] += 1
+        if fi["t"] >= _total(fi["move"]):
+            fi["move"], fi["t"], fi["done"] = None, 0, False
+    S["tick"] += 1
+    a, b = P[0]["hp"], P[1]["hp"]
+    if a <= 0 or b <= 0:
+        S["over"] = True
+        S["winner"] = -1 if a <= 0 and b <= 0 else (1 if a <= 0 else 0)
+
+
+def duel_frame(S):
+    """A plain snapshot of the fight for drawing."""
+    out = []
+    for fi in S["p"]:
+        d = DUEL_MOVES[fi["move"]] if fi["move"] else None
+        active = bool(d and d["kind"] in ("strike", "throw")
+                      and d["su"] <= fi["t"] - 1 < d["su"] + d["act"])
+        out.append({"x": fi["x"], "f": fi["f"], "hp": fi["hp"],
+                    "move": fi["move"], "stun": fi["stun"], "t": fi["t"],
+                    "ko": fi["hp"] <= 0, "ev": [],
+                    "guard": bool(d and d["kind"] == "guard"
+                                  and d["su"] <= fi["t"] - 1 < d["su"] + d["act"]),
+                    "active": active,
+                    "reach": d["reach"] if d and "reach" in d else 0})
+    return {"tick": S["tick"], "p": out, "ev": []}
+
+
+def duel_round(S, choices):
+    """Apply the chosen moves and play on until somebody can act again.
+    choices: {fighter index: move name} for every fighter in duel_need(S).
+    Returns (frames, events). Bad or missing choices become 'wait'."""
+    for i in duel_need(S):
+        m = choices.get(i)
+        S["p"][i]["move"] = m if m in DUEL_MOVES else "wait"
+        S["p"][i]["t"], S["p"][i]["done"] = 0, False
+    S["round"] += 1
+    frames, ev = [duel_frame(S)], []
+    for _ in range(DUEL_MAX_ROUND_TICKS):
+        n0 = len(ev)
+        duel_tick(S, ev)
+        frames.append(duel_frame(S))
+        frames[-1]["ev"] = ev[n0:]          # what happened on this tick
+        if S["over"] or duel_need(S):
+            break
+    else:                                   # nobody ever got free: reset them
+        for fi in S["p"]:
+            fi["move"], fi["t"], fi["stun"], fi["done"] = None, 0, 0, False
+    if not S["over"] and S["round"] >= DUEL_MAX_ROUNDS:
+        S["over"] = True
+        a, b = S["p"][0]["hp"], S["p"][1]["hp"]
+        S["winner"] = -1 if a == b else (0 if a > b else 1)
+    return frames, ev
+
+
+def duel_commit(gid, rnd, uid, move, nonce):
+    return hashlib.sha256(
+        f"{gid}|{rnd}|{uid}|{move}|{nonce}".encode()).hexdigest()
+
+
+# ------------------------------------------------------------- duel art
+# Nidhogg-1 look: flat-colour silhouette fencers (yellow vs orange) on
+# posterised skies in front of black scenery. This part draws nothing
+# itself: it turns a fight frame into a list of (x, y, w, h, colour)
+# pixel rectangles on a small logical canvas, and the window scales them
+# up. No Tk in here, so it can be tested by saving pictures.
+DUEL_LW, DUEL_LH = 200, 100          # logical canvas, in pixels
+DUEL_GY = 76                         # the ground line
+DUEL_U = 8                           # logical pixels per arena unit
+DUEL_MX = 20                         # left margin
+DUEL_COLS = ("#ffd21f", "#ff7a1a")   # yellow, orange
+DUEL_STAGES = (
+    dict(name="castle", sky=("#3b1f63", "#6f3482", "#c04a7e"), sun="#ffb347",
+         sunat=(148, 30, 13), sil="#10081a", edge="#ff9a3c"),
+    dict(name="wilds", sky=("#0f3d3b", "#17655c", "#2f9470"), sun="#eaf7a4",
+         sunat=(40, 28, 11), sil="#04201e", edge="#b7f36b"),
+    dict(name="dusk", sky=("#192a5f", "#2f50a3", "#6c93e6"), sun="#fff1cb",
+         sunat=(120, 24, 9), sil="#070c24", edge="#8fd0ff"),
+    dict(name="embers", sky=("#4b1016", "#8e1e1e", "#d24a20"), sun="#ffd9a3",
+         sunat=(70, 34, 15), sil="#1c0507", edge="#ff6a3a"),
+)
+_BG_CACHE = {}
+
+
+def duel_stage_for(gid, rnd):
+    """Same stage on both laptops; the scenery changes every 10 rounds."""
+    try:
+        base = int(gid[:4], 16)
+    except (TypeError, ValueError):
+        base = 0
+    return (base + (rnd - 1) // 10) % len(DUEL_STAGES)
+
+
+def _lerp(a, b, u):
+    return int(round(a + (b - a) * u))
+
+
+def _line(x0, y0, x1, y1, th=1):
+    """Pixels of a thick line (Bresenham with a square brush)."""
+    pts = set()
+    dx, dy = abs(x1 - x0), -abs(y1 - y0)
+    sx, sy = (1 if x0 < x1 else -1), (1 if y0 < y1 else -1)
+    err = dx + dy
+    for _ in range(600):
+        for ox in range(th):
+            for oy in range(th):
+                pts.add((x0 + ox, y0 + oy))
+        if x0 == x1 and y0 == y1:
+            break
+        e2 = 2 * err
+        if e2 >= dy:
+            err += dy
+            x0 += sx
+        if e2 <= dx:
+            err += dx
+            y0 += sy
+    return pts
+
+
+def _runs(pts, colour):
+    """Merge pixels into horizontal runs (fewer rectangles to draw)."""
+    out, run = [], None
+    for (x, y) in sorted(pts, key=lambda p: (p[1], p[0])):
+        if run and run[1] == y and run[0] + run[2] == x:
+            run[2] += 1
+        else:
+            if run:
+                out.append((run[0], run[1], run[2], 1, colour))
+            run = [x, y, 1]
+    if run:
+        out.append((run[0], run[1], run[2], 1, colour))
+    return out
+
+
+def _disc(cx, cy, r, colour):
+    out = []
+    for dy in range(-r, r + 1):
+        w = int((r * r - dy * dy) ** 0.5)
+        out.append((cx - w, cy + dy, 2 * w + 1, 1, colour))
+    return out
+
+
+def _scenery(stage):
+    """Black silhouettes behind the fighters, built once per stage."""
+    s = DUEL_STAGES[stage]
+    sil, sky = s["sil"], s["sky"][2]
+    gy = DUEL_GY
+    out = []
+    seed = [stage * 7919 + 13]
+
+    def rnd(n):
+        seed[0] = (seed[0] * 1103515245 + 12345) & 0x7FFFFFFF
+        return (seed[0] >> 8) % n
+    if s["name"] == "castle":
+        out.append((0, 52, DUEL_LW, gy - 52, sil))
+        for x in range(0, DUEL_LW, 10):
+            out.append((x, 48, 6, 4, sil))
+        for tx, tw, top in ((14, 16, 22), (118, 22, 14), (176, 14, 30)):
+            out.append((tx, top, tw, 52 - top, sil))
+            for x in range(tx, tx + tw, 4):
+                out.append((x, top - 3, 2, 3, sil))
+            out.append((tx + tw // 2 - 1, top + 8, 2, 4, sky))      # lit window
+    elif s["name"] == "wilds":
+        for x in range(0, DUEL_LW, 4):
+            h = 54 + rnd(6)
+            out.append((x, h, 4, gy - h, sil))
+        for tx in (12, 52, 96, 140, 182):
+            h = 14 + rnd(10)
+            for row in range(h):
+                w = 1 + row // 2
+                out.append((tx - w // 2, 54 - h + row, w, 1, sil))
+            out.append((tx - 1, 54, 2, 4, sil))
+    elif s["name"] == "dusk":
+        x = 0
+        while x < DUEL_LW:
+            w, h = 8 + rnd(10), 22 + rnd(24)
+            out.append((x, 58 - h + 14, w, gy - (58 - h + 14), sil))
+            for wy in range(58 - h + 18, 56, 6):
+                if rnd(3) == 0:
+                    out.append((x + 2, wy, 2, 3, sky))
+            x += w
+    else:                                                  # embers: ruins
+        out.append((0, 56, DUEL_LW, gy - 56, sil))
+        for cx in (10, 44, 80, 128, 160, 188):
+            h = 14 + rnd(20)
+            out.append((cx, 56 - h, 6, h, sil))
+            out.append((cx - 2, 56 - h - 2, 10, 3, sil))
+            if rnd(2):
+                out.append((cx + 2, 56 - h - 6, 3, 4, sil))
+    return out
+
+
+def duel_bg_rects(stage):
+    """Sky, sun, scenery and ground for one stage (cached)."""
+    if stage in _BG_CACHE:
+        return _BG_CACHE[stage]
+    s = DUEL_STAGES[stage]
+    out = [(0, 0, DUEL_LW, 26, s["sky"][0]), (0, 26, DUEL_LW, 22, s["sky"][1]),
+           (0, 48, DUEL_LW, DUEL_GY - 48, s["sky"][2])]
+    out += _disc(*s["sunat"][:2], s["sunat"][2], s["sun"])
+    out += _scenery(stage)
+    out.append((0, DUEL_GY, DUEL_LW, DUEL_LH - DUEL_GY, s["sil"]))
+    out.append((0, DUEL_GY, DUEL_LW, 1, s["edge"]))
+    _BG_CACHE[stage] = out
+    return out
+
+
+# ------------------------------------------------------------- fighters
+def _phase(move, t):
+    """('su'|'act'|'rec', progress 0..1, step inside the active part)."""
+    d = DUEL_MOVES[move]
+    if d["kind"] == "walk":
+        return "walk", min(1.0, t / d["steps"]), t
+    su, act, rec = d["su"], d["act"], d["rec"]
+    if t <= su:
+        return "su", (t / su if su else 1.0), 0
+    if t <= su + act:
+        return "act", (t - su) / act, t - su - 1
+    return "rec", min(1.0, (t - su - act) / rec) if rec else 1.0, 0
+
+
+def _pose(p, phase):
+    """Where every limb goes, in pixels from the fighter's feet, with
+    +x toward the opponent and -y up."""
+    m = p["move"]
+    R = DUEL_MOVES[m]["reach"] * DUEL_U if m and "reach" in DUEL_MOVES[m] else 0
+    q = dict(lean=1, ff=5, bf=-4, ffy=0, bfy=0, drop=1 if phase % 8 < 4 else 0,
+             hand=(8, -18), tip=(20, -22), bhand=(-4, -17), blade=None,
+             two=False)
+    if p["stun"] > 0 and m is None:
+        q.update(lean=-4, ff=3, bf=-6, drop=1, hand=(1, -9), tip=(8, -2),
+                 bhand=(-9, -16))
+        return q
+    if m is None or m == "wait":
+        return q
+    kind = DUEL_MOVES[m]["kind"]
+    ph, u, k = _phase(m, p["t"])
+    if kind == "walk":
+        sw = 3 if (p["t"] % 2) else -3
+        q.update(ff=5 + sw, bf=-4 - sw, ffy=-1 if sw > 0 else 0,
+                 bfy=-1 if sw < 0 else 0, drop=0,
+                 lean=2 if m == "advance" else -1)
+    elif m == "jab":
+        if ph == "su":
+            hx = _lerp(8, 1, u)
+            q.update(lean=_lerp(1, -2, u), ff=_lerp(5, 3, u), hand=(hx, -17),
+                     tip=(hx + 9, -17))
+        elif ph == "act":
+            q.update(lean=4, ff=9, bf=-5, drop=1, hand=(13, -17),
+                     tip=(max(R, 20), -17))
+        else:
+            hx = _lerp(13, 8, u)
+            q.update(lean=_lerp(4, 1, u), ff=_lerp(9, 5, u), hand=(hx, -17),
+                     tip=(_lerp(R, hx + 12, u), _lerp(-17, -22, u)))
+    elif m == "heavy":
+        if ph == "su":
+            hand = (_lerp(6, 3, u), _lerp(-20, -31, u))
+            q.update(lean=_lerp(0, -3, u), ff=4, bf=-5, hand=hand,
+                     tip=(hand[0] + 1, hand[1] - 15),
+                     bhand=(hand[0] - 2, hand[1] + 3), two=True)
+        elif ph == "act":
+            s = min(1.0, (k + 1) / DUEL_MOVES[m]["act"])
+            hand = (_lerp(5, 9, s), _lerp(-30, -18, s))
+            q.update(lean=_lerp(0, 4, s), ff=_lerp(5, 9, s), bf=-5, drop=1,
+                     hand=hand, tip=(_lerp(10, R, s), _lerp(-40, -5, s)),
+                     bhand=(hand[0] - 2, hand[1] + 2), two=True)
+        else:
+            q.update(lean=_lerp(4, 1, u), ff=_lerp(9, 5, u),
+                     drop=_lerp(2, 0, u), hand=(9, -14),
+                     tip=(_lerp(int(R * 0.8), 14, u), _lerp(-4, -16, u)))
+    elif m == "throw":
+        if ph == "su":
+            q.update(lean=_lerp(1, 3, u), ff=6, hand=(_lerp(7, 11, u), -18),
+                     tip=None, bhand=(_lerp(2, 8, u), -15))
+        elif ph == "act":
+            q.update(lean=5, ff=10, bf=-5, drop=1, hand=(R - 1, -17),
+                     tip=None, bhand=(R - 3, -14))
+        else:
+            q.update(lean=_lerp(5, 1, u), ff=_lerp(10, 5, u),
+                     drop=_lerp(2, 0, u), hand=(_lerp(R - 1, 8, u), -17),
+                     tip=None, bhand=(_lerp(R - 3, -4, u), -15))
+    elif m == "block":
+        up = {"su": 0.5 + 0.5 * u, "act": 1.0, "rec": 1.0 - u}[ph]
+        q.update(lean=0, ff=4, hand=(9, -15), tip=None,
+                 blade=((9, -3), (9, -3 - int(31 * up))), bhand=(2, -15))
+    return q
+
+
+def _fighter(p, cx, colour, phase, flash, goal=False):
+    """Pixel rectangles of one fencer."""
+    gy, f = DUEL_GY, p["f"]
+
+    def X(dx):
+        return cx + f * dx
+
+    def Y(dy):
+        return gy - 1 + dy
+    col = "#ffffff" if flash else colour
+    pts, sword = set(), set()
+    if p["ko"]:                                     # lying in the blood
+        pts |= _line(X(-14), Y(-3), X(-4), Y(-3), 3)
+        pts |= _line(X(-4), Y(-2), X(5), Y(-1), 2)
+        pts |= _line(X(-12), Y(-5), X(-8), Y(-1), 2)
+        for dx in range(-20, -14):
+            for dy in range(-6, -1):
+                if not (dx in (-20, -19) and dy in (-6, -5)):
+                    pts.add((X(dx), Y(dy)))
+        sword |= _line(X(7), Y(-1), X(20), Y(-1), 1)
+        out = _runs(pts, col) + _runs(sword, col)
+        out.append((cx - 14, gy, 28, 1, colour))     # pool
+        out.append((cx - 9, gy + 1, 18, 1, colour))
+        return out
+    q = _pose(p, phase)
+    drop = q["drop"]
+    hip = (q["lean"] // 2, -12 + drop)
+    sho = (q["lean"], -21 + drop)
+    head = (q["lean"] + 1, -26 + drop)
+    pts |= _line(X(hip[0]), Y(hip[1]), X(sho[0]), Y(sho[1]), 3)
+    for (fx_, fy_) in ((q["ff"], q["ffy"]), (q["bf"], q["bfy"])):
+        pts |= _line(X(hip[0]), Y(hip[1]), X(fx_), Y(fy_), 2)
+        pts.add((X(fx_ + 1), Y(fy_)))
+        pts.add((X(fx_ + 2), Y(fy_)))
+    pts |= _line(X(sho[0]), Y(sho[1] + 1), X(q["hand"][0]), Y(q["hand"][1]), 2)
+    pts |= _line(X(sho[0]), Y(sho[1] + 1), X(q["bhand"][0]),
+                 Y(q["bhand"][1]), 2)
+    for dx in range(-2, 3):
+        for dy in range(-2, 3):
+            if abs(dx) + abs(dy) < 4:
+                pts.add((X(head[0] + dx), Y(head[1] + dy)))
+    if q["blade"]:
+        (bx0, by0), (bx1, by1) = q["blade"]
+        sword |= _line(X(bx0), Y(by0), X(bx1), Y(by1), 1)
+        for dx in (-2, -1, 0, 1, 2):
+            sword.add((X(q["hand"][0] + dx), Y(q["hand"][1] - 1)))
+    elif q["tip"]:
+        sword |= _line(X(q["hand"][0]), Y(q["hand"][1]),
+                       X(q["tip"][0]), Y(q["tip"][1]),
+                       2 if p["move"] == "heavy" else 1)
+        for dy in (-1, 0, 1):
+            sword.add((X(q["hand"][0]), Y(q["hand"][1] + dy)))
+    out = []
+    if p["move"] == "heavy" and _phase("heavy", p["t"])[0] == "act":
+        R = DUEL_MOVES["heavy"]["reach"] * DUEL_U     # faint slash trail
+        trail = set()
+        for j in range(_phase("heavy", p["t"])[2]):
+            s_ = (j + 1) / DUEL_MOVES["heavy"]["act"]
+            hx, hy = _lerp(5, 9, s_), _lerp(-30, -18, s_)
+            tx, ty = _lerp(10, R, s_), _lerp(-40, -5, s_)
+            trail |= {pt for n, pt in enumerate(sorted(_line(
+                X(hx), Y(hy), X(tx), Y(ty), 1))) if n % 2 == 0}
+        out += _runs(trail, "#ffffff")
+    out += _runs(pts, col) + _runs(sword, col)
+    if q["blade"] and p["move"] == "block" and _phase("block", p["t"])[0] \
+            == "act" and phase % 4 < 2:               # parry shimmer
+        out += _runs({(X(9 + 1), Y(by1 + 2 + j)) for j in range(0, 20, 3)},
+                     "#ffffff")
+    return out
+
+
+# ------------------------------------------------------------- effects
+class DuelFx:
+    """Blood, sparks, screen shake, white flashes. Only for looks, so
+    nothing here has to match between laptops."""
+
+    def __init__(self, seed=1):
+        self.rng = random.Random(seed)
+        self.parts = []          # [x, y, vx, vy, colour, size]
+        self.splats = []         # blood left on the ground (x, y, colour)
+        self.shake = 0
+        self.flash = [0, 0]
+        self.hold = 0            # extra frames of hit-stop
+        self.ko_done = [False, False]
+        self.stars = []          # [x, y, frames left] white impact flashes
+
+    @staticmethod
+    def _cx(p):
+        return DUEL_MX + p["x"] * DUEL_U
+
+    def _burst(self, x, y, direction, n, colour, speed=2.4):
+        for _ in range(n):
+            self.parts.append([x + self.rng.uniform(-2, 2),
+                               y + self.rng.uniform(-4, 4),
+                               direction * self.rng.uniform(0.3, speed)
+                               + self.rng.uniform(-0.4, 0.4),
+                               -self.rng.uniform(0.2, speed + 0.8),
+                               colour, 2 if self.rng.random() < 0.55 else 1])
+
+    def on_frame(self, fr):
+        P = fr["p"]
+        for e in fr.get("ev", ()):
+            b = e.split(":")
+            if b[0] == "hit":
+                d = int(b[1])
+                a = 1 - d
+                n = {"heavy": 44, "throw": 32}.get(b[2], 24)
+                self._burst(self._cx(P[d]), DUEL_GY - 18, P[a]["f"], n,
+                            DUEL_COLS[d], 3.0)
+                self.stars.append([self._cx(P[d]) - P[a]["f"] * 2,
+                                   DUEL_GY - 18, 3])
+                self.flash[d] = 3
+                self.shake = max(self.shake, 6 if b[2] == "heavy" else 4)
+                self.hold = max(self.hold, 3 if b[2] != "heavy" else 5)
+            elif b[0] == "counter":
+                d = int(b[1])
+                self._burst(self._cx(P[d]), DUEL_GY - 22, P[1 - d]["f"], 12,
+                            "#ffffff", 3.2)
+                self.shake += 2
+                self.hold += 2
+            elif b[0] == "blocked":
+                d = int(b[1])
+                x = self._cx(P[d]) + P[d]["f"] * 10
+                for c in ("#ffffff", "#ffe98a"):
+                    self._burst(x, DUEL_GY - 22, -P[d]["f"], 6, c, 2.6)
+                self.shake = max(self.shake, 2)
+                self.hold = max(self.hold, 2)
+            elif b[0] == "tech":
+                x = (self._cx(P[0]) + self._cx(P[1])) / 2
+                self._burst(x, DUEL_GY - 18, 1, 6, "#ffffff", 2)
+                self._burst(x, DUEL_GY - 18, -1, 6, "#ffffff", 2)
+        for i in (0, 1):
+            if P[i]["ko"] and not self.ko_done[i]:
+                self.ko_done[i] = True
+                self._burst(self._cx(P[i]), DUEL_GY - 18, -P[i]["f"], 40,
+                            DUEL_COLS[i], 3.2)
+                self.shake = 9
+                self.hold = 9
+
+    def step(self):
+        keep = []
+        for p in self.parts:
+            p[0] += p[2]
+            p[1] += p[3]
+            p[3] += 0.28
+            if p[1] >= DUEL_GY - 1:
+                if len(self.splats) < 500:
+                    self.splats.append((int(p[0]), DUEL_GY - 1
+                                        - self.rng.randrange(2), p[4]))
+            elif -5 < p[0] < DUEL_LW + 5:
+                keep.append(p)
+        self.parts = keep
+        self.flash = [max(0, n - 1) for n in self.flash]
+        self.stars = [[x, y, n - 1] for (x, y, n) in self.stars if n > 1]
+        if self.shake:
+            self.shake -= 1
+
+    def offset(self):
+        if not self.shake:
+            return 0, 0
+        s = 1 if self.shake % 2 else -1
+        return s * min(2, 1 + self.shake // 4), (s if self.shake > 3 else 0)
+
+
+def _hud(fr, goal):
+    """Segmented health bars (10 HP per block) and the 'GO' arrow."""
+    out = []
+    for i in (0, 1):
+        segs = (fr["p"][i]["hp"] + 9) // 10
+        x0 = 6 if i == 0 else DUEL_LW - 6 - 10 * 9
+        for n in range(10):
+            xi = x0 + (n if i == 0 else 9 - n) * 9 - (0 if i == 0 else 0)
+            out.append((xi, 12, 8, 4, DUEL_COLS[i] if n < segs else "#1a1226"))
+    if goal is not None:
+        w, loser = goal
+        x = 140 if w == 0 else 30
+        d = 1 if w == 0 else -1
+        pts = set()
+        for dx in range(0, 18):
+            for dy in range(-1, 2):
+                pts.add((x + d * dx, 38 + dy))
+        for j in range(0, 6):
+            for dy in range(-j, j + 1):
+                pts.add((x + d * (18 + 5 - j), 38 + dy))
+        out += _runs(pts, DUEL_COLS[w])
+    return out
+
+
+def duel_fg_rects(fr, fx, phase, goal=None):
+    """Everything in front of the backdrop for one frame. goal is
+    (winner, loser) once the match is over, to show the GO arrow."""
+    out = [(x, y, 1, 1, c) for (x, y, c) in fx.splats]
+    for i in (0, 1):
+        p = fr["p"][i]
+        out += _fighter(p, DUEL_MX + p["x"] * DUEL_U, DUEL_COLS[i], phase,
+                        fx.flash[i] > 0)
+    for (x, y, vx, vy, c, sz) in fx.parts:
+        out.append((int(x), int(y), sz, sz, c))
+    for (x, y, n) in fx.stars:                     # white impact cross
+        r = 2 + n
+        out += [(int(x) - r, int(y), 2 * r + 1, 1, "#ffffff"),
+                (int(x), int(y) - r, 1, 2 * r + 1, "#ffffff")]
+    out += _hud(fr, goal if phase % 6 < 4 else None)
+    return out
+
+
 # ---------------------------------------------------------------- networking
 # Quiet "ping" messages that carry one of these are real requests (a game
 # move, a font file...), so the relay must retry them, never drop them.
-LOUD_KEYS = ("items", "flip", "game", "fontreq", "blob")
+LOUD_KEYS = ("items", "flip", "game", "duel", "duel2", "fontreq", "blob")
 
 
 class Net:
@@ -1003,6 +1688,8 @@ class Net:
                 continue
             if msg.get("app") != "studychat" or msg.get("room") != self.room:
                 continue
+            if msg.get("type") == "delivery":
+                continue                  # delivery receipts are local, never wire messages
             mid = msg.get("id")
             if not mid or mid in self.seen:   # own echo or duplicate packet
                 continue
@@ -1046,6 +1733,358 @@ class Net:
         self.inbox.put(msg)
 
 
+@dataclass
+class RelayJob:
+    msg: dict
+    data: object
+    born: float
+    due: float
+    priority: int
+    game: str = ""
+    coalesce: str = ""
+    ttl: float = 300
+    tries: int = 0
+    state: str = "queued"
+    note: str = ""
+    reason: str = ""
+    retry_at: object = None     # monotonic time; local delivery metadata only
+    http_code: object = None
+
+
+class RelayOutbox:
+    """Publication scheduling, separate from HTTP and Tk for headless tests.
+
+    A successful POST means cached at ntfy, not received by the opponent.
+    Only this queue retries publications; games never retry successful sends.
+    All times used for scheduling are monotonic. UTC is only for daily usage.
+    """
+
+    def __init__(self, inbox, usage_path=None, clock=time.monotonic,
+                 wall=time.time, jitter=random.uniform, logger=None):
+        self.inbox, self.usage_path = inbox, usage_path
+        self.clock, self.wall, self.jitter = clock, wall, jitter
+        self.logger = logger or (lambda _text: None)
+        self.lock = threading.RLock()
+        self.jobs = {}
+        self.receipts = set()
+        self.tokens, self.refilled = float(RELAY_BURST), clock()
+        self.cool_until = 0
+        self.recovery_at = None
+        self.limit_generation = 0
+        self.read_until = 0
+        self.cool_n = 0
+        self.last_published = 0
+        self.day, self.count, self.quota_until = int(wall() // 86400), 0, 0
+        self.warned = False
+        if usage_path:
+            try:
+                with open(usage_path, encoding="utf-8") as f:
+                    saved = json.load(f)
+                if saved.get("day") == self.day:
+                    self.count = max(0, int(saved.get("count", 0)))
+                    self.quota_until = min((self.day + 1) * 86400,
+                                           float(saved.get("quota_until", 0)))
+            except (OSError, ValueError, TypeError, AttributeError):
+                pass
+
+    @staticmethod
+    def classify(msg):
+        g = msg.get("duel2") or msg.get("game") or {}
+        if not isinstance(g, dict):
+            g = {}
+        terminal = g.get("op") in ("quit", "cancel", "end")
+        if msg.get("type") == "leave" or terminal:
+            return 0, g.get("gid", ""), "", 120
+        if g:
+            return 2, g.get("gid", ""), "", 1800 if "duel2" in msg else 900
+        if msg.get("type") == "join":
+            return 1, "", "join", 300
+        if any(k in msg for k in ("items", "fontreq", "blob")):
+            return 3, "", "", 300
+        if msg.get("type") == "ping" and not any(k in msg for k in LOUD_KEYS):
+            key = ("who" if msg.get("text") == "who" else
+                   "roster" if "roster" in msg else
+                   "fontlist" if "fontlist" in msg else "keepalive")
+            return 4, "", key, 30 if key in ("who", "roster") else 600
+        return 1, "", "", 300
+
+    @staticmethod
+    def _category(job):
+        return ("duel" if "duel2" in job.msg else "game" if job.game else
+                "attachment" if job.data is not None else
+                "background" if job.priority >= 3 else "chat")
+
+    def _event(self, job, state, note="", reason="", retry_at=None, http_code=None):
+        if (retry_at is not None and job.retry_at is not None
+                and abs(retry_at - job.retry_at) < .01):
+            retry_at = job.retry_at   # don't emit new events for floating-point noise
+        old = (job.state, job.note, job.reason, job.retry_at, job.http_code)
+        if old == (state, note, reason, retry_at, http_code):
+            return
+        if state == "delayed" and (old[0], old[2], old[3]) != (state, reason, retry_at):
+            duration = "unknown" if retry_at is None else f"{max(0, retry_at - self.clock()):.1f}s"
+            self.logger(f"relay wait reason={reason} category={self._category(job)} "
+                        f"duration={duration} http={http_code or '-'}")
+        job.state, job.note = state, note
+        job.reason, job.retry_at, job.http_code = reason, retry_at, http_code
+        if state in ("published", "cancelled"):
+            job.data = None
+        self.inbox.put({"type": "delivery", "id": job.msg["id"],
+                        "gid": job.game, "state": state, "text": note,
+                        "reason": reason, "retry_at": retry_at, "http_code": http_code})
+
+    def _delay(self, job, reason, retry_at=None, http_code=None):
+        notes = {"budget": "Queued to send.",
+                 "server_limit": "Relay rate limit; waiting to retry.",
+                 "disconnected": "Waiting for the relay connection.",
+                 "daily_quota": "Daily relay quota reached; resumes at 00:00 UTC.",
+                 "bandwidth": "Relay bandwidth limit; waiting to retry."}
+        self._event(job, "delayed", notes[reason], reason, retry_at, http_code)
+
+    def _save(self):
+        if not self.usage_path:
+            return
+        tmp = self.usage_path + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({"day": self.day, "count": self.count,
+                           "quota_until": self.quota_until}, f)
+            os.replace(tmp, self.usage_path)
+        except OSError:
+            pass                         # usage is advisory; play still works
+
+    def _day(self):
+        day = int(self.wall() // 86400)
+        if day != self.day:
+            self.day, self.count, self.quota_until = day, 0, 0
+            self.warned = False
+            self.receipts.clear()
+            self._save()
+
+    def enqueue(self, msg, data=None):
+        with self.lock:
+            if msg["id"] in self.jobs:
+                return
+            priority, game, key, ttl = self.classify(msg)
+            for old in self.jobs.values():
+                if key and old.coalesce == key and old.state in ("queued", "delayed"):
+                    self._event(old, "cancelled")
+            # Retain recent completed jobs so late self echoes are recognized.
+            done = [mid for mid, j in self.jobs.items()
+                    if j.state in ("published", "cancelled") or
+                    (j.state == "failed" and not j.game)]
+            for mid in done[:-256]:
+                del self.jobs[mid]
+            now = self.clock()
+            job = RelayJob(msg, data, now, now, priority, game, key, ttl, state="new")
+            self.jobs[msg["id"]] = job
+            pending = sum(j.state not in ("published", "cancelled", "failed")
+                          for j in self.jobs.values())
+            self._event(job, "queued" if pending <= 256 else "failed",
+                        "" if pending <= 256 else "Send queue is full. Retry later.")
+
+    def _refill(self):
+        now = self.clock()
+        if self.recovery_at is not None:
+            if now < self.recovery_at:
+                return
+            # One request at cooldown expiry, then normal refill. A long idle
+            # period after expiry restores capacity even without any sends.
+            self.tokens = 1.0
+            self.refilled, self.recovery_at = self.recovery_at, None
+        self.tokens = min(RELAY_BURST, self.tokens +
+                          max(0, now - self.refilled) / RELAY_REFILL_SECONDS)
+        self.refilled = now
+
+    def _request_delay(self):
+        self._refill()
+        if self.clock() < self.cool_until:
+            return self.cool_until - self.clock()
+        if self.tokens >= 1 - 1e-9:
+            return 0
+        return (1 - self.tokens) * RELAY_REFILL_SECONDS
+
+    def request_stamp(self):
+        with self.lock:
+            return self.clock(), self.limit_generation
+
+    def http_success(self, stamp):
+        """Only a fresh HTTP success ends a throttle streak, never cache replay."""
+        with self.lock:
+            started, generation = stamp
+            if generation == self.limit_generation and started >= self.cool_until:
+                self.cool_n = 0
+
+    def reserve_read(self):
+        """New subscription/download requests share the request bucket, not quota."""
+        with self.lock:
+            delay = max(self._request_delay(), self.read_until - self.clock())
+            if not delay:
+                self.tokens -= 1
+            return delay
+
+    def take(self, connected=True):
+        with self.lock:
+            self._day()
+            now = self.clock()
+            waiting = []
+            blocked_games = set()
+            for job in self.jobs.values():
+                if job.state in ("published", "cancelled"):
+                    continue
+                if job.state == "failed":
+                    if job.game:
+                        blocked_games.add(job.game)
+                    continue
+                if now - job.born > job.ttl:
+                    self._event(job, "cancelled" if job.priority == 4 else "failed",
+                                "Message expired before it could be sent.")
+                    if job.game:
+                        blocked_games.add(job.game)
+                    continue
+                blocked = job.game and job.game in blocked_games and job.priority != 0
+                if job.game:
+                    blocked_games.add(job.game)
+                if job.state == "sending" or blocked:
+                    continue
+                if self.quota_until > self.wall():
+                    self._delay(job, "daily_quota", now + self.quota_until - self.wall(), 429)
+                elif job.game and not connected:
+                    self._delay(job, "disconnected")
+                elif job.due <= now:
+                    waiting.append(job)
+            if not waiting:
+                return None
+            job = min(waiting, key=lambda j: (j.priority, j.born))
+            delay = self._request_delay()
+            if delay:
+                limited = now < self.cool_until
+                self._delay(job, "server_limit" if limited else "budget",
+                            now + delay, 429 if limited else None)
+                return None
+            self.tokens -= 1
+            self._event(job, "sending")
+            return job
+
+    def published(self, mid, receipt=None):
+        with self.lock:
+            job = self.jobs.get(mid)
+            if not job:
+                return
+            self._day()
+            receipt = receipt or mid
+            if receipt not in self.receipts:
+                self.receipts.add(receipt)
+                self.count += 1
+                self.last_published = self.wall()
+                self._save()
+                if self.count >= max(1, int(RELAY_DAILY_LIMIT * .8)) and not self.warned:
+                    self.warned = True
+                    self.inbox.put({"type": "sys", "name": "", "text":
+                        f"This device has published {self.count} messages today. "
+                        "The relay allowance may be shared with other devices."})
+            if job.state != "cancelled":
+                self._event(job, "published")
+
+    def throttle(self, code, retry_after=None, category="request"):
+        with self.lock:
+            self._day()
+            if code == 42908:
+                was_limited = self.quota_until > self.wall()
+                self.quota_until = (self.day + 1) * 86400
+                self._save()
+                if not was_limited:
+                    self.logger(f"relay wait reason=daily_quota category={category} "
+                                f"duration={self.quota_until - self.wall():.1f}s http=429")
+                    self.inbox.put({"type": "sys", "name": "", "text":
+                        "Daily relay quota reached. Publishing resumes at 00:00 UTC; "
+                        "you can still receive messages."})
+                return
+            if code == 42905:
+                delay = retry_after if retry_after is not None else (
+                    (self.day + 1) * 86400 - self.wall())
+                self.read_until = max(self.read_until, self.clock() + delay)
+                self.logger(f"relay wait reason=bandwidth category={category} "
+                            f"duration={delay:.1f}s http=429")
+                return
+            now = self.clock()
+            self._refill()
+            self.cool_n = min(6, self.cool_n + 1)
+            if self.cool_n == 1:
+                self.inbox.put({"type": "sys", "name": "", "text":
+                    "Relay is busy. Sends are queued while it recovers."})
+            delay = (retry_after if retry_after is not None else
+                     min(300, 15 * 2 ** (self.cool_n - 1) * self.jitter(1, 1.2)))
+            self.cool_until = max(self.cool_until, now + delay)
+            self.recovery_at = self.cool_until
+            self.limit_generation += 1
+            self.tokens = 0
+            self.logger(f"relay wait reason=server_limit category={category} "
+                        f"duration={self.cool_until - now:.1f}s http=429")
+
+    def failed(self, job, note, transient=True, limited=False, http_code=None,
+               reason="server_limit"):
+        with self.lock:
+            if job.state in ("published", "cancelled"):
+                return                    # an echo may have confirmed a lost HTTP response
+            if limited:
+                now = self.clock()
+                deadline = (now + self.quota_until - self.wall() if reason == "daily_quota"
+                            else self.read_until if reason == "bandwidth" else self.cool_until)
+                job.due = deadline if reason == "bandwidth" else now
+                self._delay(job, reason, deadline, http_code)
+            elif transient and job.tries < 3:
+                job.tries += 1
+                job.due = self.clock() + (5, 15, 30)[job.tries - 1] * self.jitter(1, 1.2)
+                self._event(job, "delayed", note, "network_retry", job.due, http_code)
+            else:
+                self._event(job, "cancelled" if job.priority == 4 else "failed", note)
+
+    def retry(self, mid):
+        with self.lock:
+            job = self.jobs.get(mid)
+            if job and job.state == "failed":
+                job.tries = 0
+                job.born = job.due = self.clock()
+                self._event(job, "queued")
+
+    def retry_failed(self):
+        with self.lock:
+            failed = [mid for mid, j in self.jobs.items() if j.state == "failed"]
+            for mid in failed:
+                self.retry(mid)
+            return len(failed)
+
+    def cancel_game(self, gid, keep_terminal=True):
+        with self.lock:
+            for job in self.jobs.values():
+                if (job.game == gid and (not keep_terminal or job.priority != 0)
+                        and job.state != "published"):
+                    self._event(job, "cancelled")
+
+
+def relay_error(ex, now):
+    """Read bounded ntfy error details and both legal Retry-After formats."""
+    try:
+        body = json.loads(ex.read(8192))
+        code = body.get("code") if isinstance(body, dict) else None
+    except (OSError, ValueError):
+        code = None
+    finally:
+        ex.close()
+    raw = ex.headers.get("Retry-After") if ex.headers else None
+    delay = None
+    if raw:
+        try:
+            delay = max(0, int(raw))
+        except ValueError:
+            try:
+                delay = max(0, email.utils.parsedate_to_datetime(raw).timestamp() - now)
+            except (TypeError, ValueError, OverflowError):
+                pass
+    return code, delay
+
+
 class RelayNet:
     """Online mode: messages go through a free public relay (ntfy.sh) over
     HTTPS, so it works on school wifi that stops laptops from seeing each
@@ -1064,11 +2103,7 @@ class RelayNet:
         # The free relay allows only a few posts per minute for everyone on
         # the same internet address, so keep background chatter rare.
         self.ping_every = max(ONLINE_PING_EVERY, 180)
-        self.cool_until = 0              # pause quiet signals after a 429
-        self.cool_n = 0                  # 429s in a row (longer pause each time)
-        self.deferred = {}               # quiet signals held back, to retry
         self.join_ok = False             # our "joined" reached the relay
-        self.held_note = False           # told the person about a slow relay
         self.token = os.environ.get("STUDYCHAT_TOKEN")   # ntfy account
         self.base = RELAY_URL.rstrip("/")
         self.topic = "sc-" + hashlib.sha256(
@@ -1078,7 +2113,12 @@ class RelayNet:
             self.ctx = ssl.create_default_context(cafile=certifi.where())
         except Exception:
             self.ctx = ssl.create_default_context()
-        self.sendq = queue.Queue()
+        scope = hashlib.sha256((self.base + "|" + (self.token or "anonymous"))
+                               .encode()).hexdigest()[:16]
+        usage_path = os.path.join(os.path.expanduser("~"),
+                                  f".studychat-net-{scope}.json")
+        self.outbox = RelayOutbox(inbox, usage_path, logger=log)
+        self.stop = threading.Event()
         threading.Thread(target=self._sender, daemon=True).start()
         threading.Thread(target=self._subscribe, daemon=True).start()
 
@@ -1099,17 +2139,17 @@ class RelayNet:
         if extra:
             msg.update(extra)
         self.seen.add(msg["id"])
-        self.sendq.put((msg, None))
+        self.outbox.enqueue(msg)
         return msg
 
     def send_image(self, data, extra=None):
         msg = {"app": "studychat", "room": self.room, "id": uuid.uuid4().hex,
                "name": self.name, "text": "", "type": "img",
-               "size": len(data)}
+               "size": len(data), "uid": self.uid}
         if extra:
             msg.update(extra)
         self.seen.add(msg["id"])
-        self.sendq.put((msg, data))
+        self.outbox.enqueue(msg, data)
         return dict(msg, data=data)
 
     def send_blob(self, data, extra):
@@ -1119,130 +2159,101 @@ class RelayNet:
                "uid": self.uid, "size": len(data)}
         msg.update(extra)
         self.seen.add(msg["id"])
-        self.sendq.put((msg, data))
+        self.outbox.enqueue(msg, data)
         return msg
 
-    # Quiet signals (joined, who's here, still here) are not chat, but they
-    # are how people see each other. If the relay is busy they used to be
-    # thrown away, so nobody ever appeared. Now they are held and retried,
-    # and a newer signal of the same kind replaces an older one.
-    HOLD_FOR = {"join": 300, "ping:keepalive": 600, "ping:who": 30,
-                "ping:roster": 30, "ping:fontlist": 300}
-
-    @staticmethod
-    def _key(msg):
-        t = msg.get("type")
-        if t == "ping":
-            return "ping:" + ("who" if msg.get("text") == "who" else
-                              "roster" if "roster" in msg else
-                              "fontlist" if "fontlist" in msg else
-                              "keepalive")
-        return t
-
-    def _hold(self, msg, data, born, tries, fresh):
-        key = self._key(msg)
-        if key not in self.HOLD_FOR:
-            return                   # chat is never held
-        if key in self.deferred and not fresh:
-            return                   # a retry never replaces a newer signal
-        self.deferred.pop(key, None)
-        self.deferred[key] = (msg, data, born, tries)
-        if not self.held_note and key == "join":
-            self.held_note = True
-            log("join held back by the relay")
-            self._status("the chat server is busy, so others may not see "
-                         "you yet. Retrying...")
+    def _send_once(self):
+        job = self.outbox.take(self.connected)
+        if job is None:
+            return False
+        msg, data = job.msg, job.data
+        meta = json.dumps(msg, separators=(",", ":"))
+        url = f"{self.base}/{self.topic}"
+        if data is None:
+            body = meta.encode("utf-8")
+            if len(body) > 4096:
+                self.outbox.failed(job, "Message exceeds the relay's 4096-byte limit.", False)
+                return True
+            req = urllib.request.Request(url, data=body, method="POST")
+        else:
+            ext = ("png" if data.startswith(b"\x89PNG") else
+                   "gif" if data.startswith(b"GIF8") else
+                   "ttf" if msg.get("blob") == "font" else "jpg")
+            req = urllib.request.Request(url, data=data, method="PUT",
+                                         headers={"Filename": f"image.{ext}",
+                                                  "Message": meta})
+        stamp = self.outbox.request_stamp()
+        try:
+            with self._open(req, 30) as resp:
+                raw = resp.read()
+            self.outbox.http_success(stamp)
+            try:
+                receipt = json.loads(raw).get("id")
+            except (ValueError, AttributeError):
+                receipt = None
+            self.outbox.published(msg["id"], receipt)
+            if msg.get("type") == "join":
+                self.join_ok = True
+        except urllib.error.HTTPError as ex:
+            code, delay = relay_error(ex, time.time())
+            if ex.code == 429:
+                self.outbox.throttle(code, delay, self.outbox._category(job))
+            note = ("Daily relay quota reached; resumes at 00:00 UTC." if code == 42908
+                    else "Relay is busy; waiting to retry." if ex.code == 429
+                    else f"Message not sent (HTTP {ex.code}).")
+            reason = ("daily_quota" if code == 42908 else "bandwidth"
+                      if code == 42905 else "server_limit")
+            self.outbox.failed(job, note, ex.code >= 500, ex.code == 429,
+                               http_code=ex.code, reason=reason)
+        except (OSError, ValueError):
+            self.outbox.failed(job, "Connection interrupted; waiting to retry.")
+        return True
 
     def _sender(self):
-        url = f"{self.base}/{self.topic}"
-        while True:
-            from_queue = True
-            try:
-                msg, data = self.sendq.get(timeout=1)
-                born, tries = time.time(), 0
-            except queue.Empty:
-                # nothing new: retry a held-back signal once the relay allows
-                if not self.deferred or time.time() < self.cool_until:
-                    continue
-                key = next(iter(self.deferred))
-                msg, data, born, tries = self.deferred.pop(key)
-                from_queue = False
-                if time.time() - born > self.HOLD_FOR.get(key, 0):
-                    continue                     # too old to be useful
-            quiet = (msg.get("type") in ("ping", "join", "leave")
-                     # history, flips, game moves and font files must never
-                     # be dropped
-                     and not any(k in msg for k in LOUD_KEYS))
-            try:
-                if (quiet and msg.get("type") != "leave"
-                        and time.time() < self.cool_until):
-                    self._hold(msg, data, born, tries, from_queue)   # angry
-                    continue
-                meta = json.dumps(msg)           # one ASCII line
-                for attempt in range(4):
-                    if data is None:
-                        req = urllib.request.Request(
-                            url, data=meta.encode("utf-8"), method="POST")
-                    else:
-                        ext = ("png" if data.startswith(b"\x89PNG") else
-                               "gif" if data.startswith(b"GIF8") else
-                               "ttf" if msg.get("blob") == "font" else "jpg")
-                        req = urllib.request.Request(
-                            url, data=data, method="PUT",
-                            headers={"Filename": f"image.{ext}",
-                                     "Message": meta})
-                    try:
-                        self._open(req, 60).read()
-                        self.cool_n = 0
-                        if msg.get("type") == "join":
-                            self.join_ok = True
-                            if self.held_note:
-                                self.held_note = False
-                                self._status("connected: others can see "
-                                             "you now")
-                        break
-                    except urllib.error.HTTPError as ex:
-                        if ex.code == 429:
-                            self.cool_n += 1
-                            self.cool_until = time.time() + min(
-                                60, 15 * 2 ** (self.cool_n - 1))
-                        if ex.code != 429 or quiet or attempt == 3:
-                            raise
-                        # the relay says slow down: wait, then try again
-                        if attempt == 0:
-                            self._status("relay is busy, retrying...")
-                        time.sleep(5 * (attempt + 1))
-            except urllib.error.HTTPError as ex:
-                if quiet and msg.get("type") != "leave" and tries < 8:
-                    self._hold(msg, data, born, tries + 1, from_queue)
-                elif not quiet:
-                    self._status("relay is too busy, message not sent; "
-                                 "try again in a minute" if ex.code == 429
-                                 else f"message not sent (error {ex.code})")
-            except Exception:
-                if quiet and msg.get("type") != "leave" and tries < 8:
-                    self.cool_until = max(self.cool_until, time.time() + 5)
-                    self._hold(msg, data, born, tries + 1, from_queue)
-                elif not quiet:
-                    self._status("message not sent (is the internet "
-                                 "working?)")
-            finally:
-                if from_queue:
-                    self.sendq.task_done()
+        while not self.stop.is_set():
+            if not self._send_once():
+                self.stop.wait(.25)
+
+    def cancel_game(self, gid, keep_terminal=True):
+        self.outbox.cancel_game(gid, keep_terminal)
+
+    def retry(self, mid):
+        self.outbox.retry(mid)
 
     def close(self):
-        """Tell everyone we're leaving, and give it a moment to go out."""
         if self.closed:
             return
         self.closed = True
-        self.send("left", kind="leave")
-        waiter = threading.Thread(target=self.sendq.join, daemon=True)
-        waiter.start()
-        waiter.join(4)
+        leave = self.send("left", kind="leave")
+        deadline = time.monotonic() + 4
+        while time.monotonic() < deadline:
+            if self.outbox.jobs[leave["id"]].state in ("published", "failed"):
+                break
+            time.sleep(.05)
+        self.stop.set()
+
+    def _read_open(self, req, timeout):
+        while not self.stop.is_set():
+            delay = self.outbox.reserve_read()
+            if not delay:
+                stamp = self.outbox.request_stamp()
+                try:
+                    response = self._open(req, timeout)
+                    self.outbox.http_success(stamp)
+                    return response
+                except urllib.error.HTTPError as ex:
+                    if ex.code == 429:
+                        code, wait = relay_error(ex, time.time())
+                        category = ("subscription" if "/json?" in req.full_url else
+                                    "health" if req.full_url.endswith("/v1/health") else "download")
+                        self.outbox.throttle(code, wait, category)
+                    raise
+            self.stop.wait(min(delay, .25))
+        raise OSError("connection closed")
 
     def _server_now(self):
         try:
-            with self._open(urllib.request.Request(
+            with self._read_open(urllib.request.Request(
                     self.base + "/v1/health"), 8) as r:
                 return email.utils.parsedate_to_datetime(
                     r.headers.get("Date")).timestamp()
@@ -1257,11 +2268,11 @@ class RelayNet:
         # would be missed (the wrong "online" count on first join).
         start = str(int(self._server_now() - 3))
         failed = False
-        while True:
+        while not self.stop.is_set():
             try:
                 url = (f"{self.base}/{self.topic}/json?since="
                        f"{self.last_id or start}")
-                with self._open(urllib.request.Request(url), 90) as resp:
+                with self._read_open(urllib.request.Request(url), 90) as resp:
                     if not self.connected:
                         self.connected = True
                         self._status("online" if not failed
@@ -1276,7 +2287,7 @@ class RelayNet:
                 if not failed:
                     self._status("can't reach the chat server, retrying...")
                 failed = True
-            time.sleep(backoff)
+            self.stop.wait(backoff)
             backoff = min(backoff * 2, 15)
 
     def _handle(self, raw):
@@ -1292,8 +2303,14 @@ class RelayNet:
             return
         if msg.get("app") != "studychat" or msg.get("room") != self.room:
             return
+        if msg.get("type") == "delivery":
+            return
         mid = msg.get("id")
-        if not mid or mid in self.seen:           # our own echo or a repeat
+        if isinstance(mid, str) and msg.get("uid") == self.uid:
+            self.outbox.published(mid, ev.get("id"))
+            if msg.get("type") == "join":
+                self.join_ok = True
+        if not isinstance(mid, str) or not mid or mid in self.seen:           # our own echo or a repeat
             return
         self.seen.add(mid)
         msg.pop("data", None)
@@ -1318,7 +2335,7 @@ class RelayNet:
         try:
             if not str(url).startswith(self.base + "/"):   # only our relay
                 raise ValueError("unexpected url")
-            with self._open(urllib.request.Request(url), 30) as resp:
+            with self._read_open(urllib.request.Request(url), 30) as resp:
                 data = resp.read(MAX_IMAGE_BYTES + 1)
             if not data or len(data) > MAX_IMAGE_BYTES:
                 raise ValueError("bad size")
@@ -1611,6 +2628,7 @@ class Overlay:
         self.font_served = []               # when I last sent a font away
         self.font_folder_noted = False
         self.game = None                    # the number guesser now running
+        self.duel = None                    # the duel now running
         self.full_anims = []                # ...and in full-size viewers
         self.presence = Presence()
         # Joining already says "I'm here", so the first "still here" signal
@@ -2517,6 +3535,11 @@ class Overlay:
                           command=self.game_end_cmd)
         else:
             m.add_command(label="Number guesser...", command=self.game_cmd)
+        if self.duel and not self.duel["over"]:
+            m.add_command(label="Quit the duel" if self.duel["state"] == "playing"
+                          else "Cancel the duel", command=self.duel_quit_cmd)
+        else:
+            m.add_command(label="Duel...", command=self.duel_cmd)
         m.add_command(label="Flip everyone's chat", command=self.flip_cmd)
         m.add_command(label="Send GIF of the reel", command=self.clip_reel)
         m.add_command(label="Pick the reel area again",
@@ -3204,6 +4227,13 @@ class Overlay:
         if text in ("/guess", "/numberguess"):
             self.game_cmd()
             return
+        if text == "/duel":
+            self.duel_cmd()
+            return
+        if text == "/retry":
+            count = self.net.outbox.retry_failed() if self.net.mode == "online" else 0
+            self.note(f"Retrying {count} failed send(s).")
+            return
         if text == "/reels" or text.startswith("/reels "):
             self.open_reels(text[6:])
             return
@@ -3439,6 +4469,8 @@ class Overlay:
         self.net.send("", kind="ping",
                       extra={"game": {"op": "end", "gid": G["gid"]}})
         G["over"] = True
+        if self.net.mode == "online":
+            self.net.cancel_game(G["gid"])
         self.note("you ended the number guesser")
 
     def _game_host_window(self):
@@ -3555,6 +4587,8 @@ class Overlay:
             if n is None:
                 return
             first = uid not in G["guessed"]
+            if not first and self.net.mode == "online":
+                return                       # the cached result is already in the stream
             if first:
                 G["guessed"][uid] = (n, n == G["secret"])
             n, ok = G["guessed"][uid]    # asked twice? same answer again
@@ -3579,9 +4613,13 @@ class Overlay:
             self._game_announce(gname, n, ok, secret)
             if ok:
                 G["over"] = True
+                if self.net.mode == "online":
+                    self.net.cancel_game(G["gid"], keep_terminal=False)
             self._game_result_ui(mine, ok, gname, n, secret)
         elif op == "end" and not G["mine"] and uid == G["host_uid"]:
             G["over"] = True
+            if self.net.mode == "online":
+                self.net.cancel_game(G["gid"], keep_terminal=False)
             self._game_close_window()
             self.note(f"{G['host']} ended the number guesser")
 
@@ -3652,11 +4690,16 @@ class Overlay:
 
     def _game_send_guess(self, n):
         G = self.game
-        self.net.send("", kind="ping", extra={
+        msg = self.net.send("", kind="ping", extra={
             "game": {"op": "guess", "gid": G["gid"], "n": n}})
+        if self.net.mode == "online":
+            G["guess_id"], G["guess_delivery"] = msg["id"], "queued"
 
     def _game_skip(self):
         """"No thanks": close the popup. Skipping is never punished."""
+        if self.net.mode == "online" and self.game:
+            self.net.cancel_game(self.game["gid"])
+            self.game["over"] = True
         self._game_close_window()
 
     def _game_result_ui(self, mine, ok, gname, n, secret):
@@ -3705,6 +4748,8 @@ class Overlay:
         G = self.game
         if G and not G["mine"] and not G["over"] and uid == G["host_uid"]:
             G["over"] = True
+            if self.net.mode == "online":
+                self.net.cancel_game(G["gid"])
             self._game_close_window()
             self.note(f"{G['host']} left, so the number guesser ended")
 
@@ -3717,13 +4762,17 @@ class Overlay:
                 self.net.send("", kind="ping",
                               extra={"game": {"op": "end", "gid": G["gid"]}})
             G["over"] = True
+            if self.net.mode == "online":
+                self.net.cancel_game(G["gid"])
             self._game_close_window()
             self.note("the number guesser timed out")
             return
         if G["mine"] or G["my_guess"] is None:
             return
+        if self.net.mode == "online" and G.get("guess_delivery") != "published":
+            return
         waited = now - G["asked_at"]
-        if waited > 20 and not G["resent"]:          # the guess may be lost
+        if waited > 20 and not G["resent"] and self.net.mode != "online":
             G["resent"] = True
             self._game_send_guess(G["my_guess"])
         elif waited > 50 and G.get("ui") and not G.get("gave_up"):
@@ -3734,6 +4783,825 @@ class Overlay:
                 G["ui"]["skip"].config(state="normal")
             except Exception:
                 pass
+
+    # ---- duel
+    # /duel challenges the room; the first person to click Accept fights
+    # the challenger. Each turn both players secretly pick a move: first a
+    # fingerprint (hash) of the pick, then the pick itself once both have
+    # committed, so nobody can change their mind. Every laptop then plays
+    # the identical fight with duel_round(), so only picks are sent.
+    DUEL_SECONDS = 1800
+
+    def _duel_blank(self, gid, host_uid, host, mine):
+        return {"gid": gid, "host_uid": host_uid, "host": host, "mine": mine,
+                "state": "waiting" if mine else "invited", "over": False,
+                "t0": time.time(), "me": None, "uids": [None, None],
+                "names": ["", ""], "S": None, "r": 1, "commits": {},
+                "reveals": {}, "pick": None, "nonce": "", "anim": False,
+                "win": None, "ui": None, "resend_at": 0, "peer_seen": False,
+                "accept_at": 0, "accept_n": 0, "forfeit_at": 0,
+                "last": "", "pop": None, "out": {}, "peer_done": 0,
+                "v2": self.net.mode == "online", "delivery": {}}
+
+    def duel_cmd(self):
+        """/duel or the menu: challenge the room (or cancel your challenge)."""
+        D = self.duel
+        if D and not D["over"]:
+            if D["mine"] and D["state"] == "waiting":
+                self._duel_send({"op": "cancel"})
+                self._duel_over("you cancelled the duel challenge")
+            elif D["state"] == "playing":
+                self.duel_quit_cmd()
+            else:
+                self.note(f"{D['host']} already has a duel challenge up")
+            return
+        gid = uuid.uuid4().hex[:12]
+        self.duel = self._duel_blank(gid, self.net.uid, self.net.name, True)
+        self._duel_send({"op": "challenge"})
+        self.note("you challenged the room to a duel. Waiting for someone "
+                  "to accept (type /duel again to cancel)" +
+                  (". Online Duel requires the updated app on both computers."
+                   if self.duel["v2"] else ""))
+
+    def duel_quit_cmd(self):
+        D = self.duel
+        if not D or D["over"]:
+            return
+        if D["state"] == "playing":
+            self._duel_forfeit()
+        elif D["mine"] and D["state"] == "waiting":
+            self.duel_cmd()
+
+    def _duel_send(self, d):
+        D = self.duel
+        d = dict(d)
+        d["gid"] = D["gid"]
+        if D.get("S") and not D["v2"]:
+            d["a"] = D["S"]["round"]         # rounds I have finished
+        if D["v2"]:
+            d["v"] = 2
+        msg = self.net.send("", kind="ping", extra={
+            "duel2" if D["v2"] else "duel": d})
+        if D["v2"]:
+            D["delivery"][(d.get("r"), d["op"])] = {
+                "id": msg["id"], "state": "queued"}
+        return msg
+
+    def _duel_out(self, d):
+        """Send a pick, and keep it to resend until they've played past it."""
+        D = self.duel
+        D["out"][(d["r"], d["op"])] = d
+        self._duel_send(d)
+
+    def _duel_over(self, note=None):
+        D = self.duel
+        if not D:
+            return
+        D["over"] = True
+        if D["v2"]:
+            self.net.cancel_game(D["gid"])
+        self._duel_close_popup()
+        if note:
+            self.note(note)
+
+    def _duel_close_popup(self):
+        D = self.duel
+        pop = D.get("pop") if D else None
+        if pop is not None:
+            try:
+                pop.destroy()
+            except Exception:
+                pass
+            D["pop"] = None
+        self.busy = (self.settings_win is not None
+                     or bool(D and D.get("win")))
+        self._touch()
+
+    # ---- receiving
+    def _duel_msg(self, msg):
+        """Everything the duel receives. Fields come from other computers,
+        so every one is checked."""
+        online = self.net.mode == "online"
+        if online and "duel2" not in msg:
+            if msg.get("duel", {}).get("op") == "challenge":
+                self.note("Online Duel needs the updated app on both computers. "
+                          "Ask the challenger to update.")
+            return
+        d, uid = msg.get("duel2" if online else "duel", {}), msg.get("uid")
+        if not isinstance(d, dict) or (online and d.get("v") != 2):
+            return
+        if not isinstance(uid, str) or not uid:
+            return
+        op, gid = d.get("op"), d.get("gid")
+        if not (isinstance(gid, str) and re.fullmatch(r"[0-9a-f]{12}", gid)):
+            return
+        D = self.duel
+        name = str(msg.get("name", "?"))[:20]
+        if op == "challenge":
+            if D and not D["over"]:
+                return                               # one duel at a time
+            self.duel = self._duel_blank(gid, uid, name, False)
+            self.note(f"{name} challenged the room to a duel")
+            try:
+                self._duel_popup()
+            except Exception:
+                log("duel popup failed: " + traceback.format_exc())
+            return
+        if not D or D["gid"] != gid or D["over"]:
+            return
+        if op == "cancel" and uid == D["host_uid"] and not D["mine"] \
+                and D["state"] in ("invited", "accepting"):
+            self._duel_over(f"{D['host']} cancelled the duel")
+        elif op == "accept" and D["mine"] and D["state"] == "waiting":
+            self._duel_start([self.net.uid, uid], [self.net.name, name])
+            self._duel_send({"op": "go", "p1": uid, "n1": name,
+                             "n0": self.net.name})
+            D["go_sent"] = time.time()
+            self.note(f"{name} accepted your duel!")
+        elif op == "go" and uid == D["host_uid"] and not D["mine"] \
+                and D["state"] in ("invited", "accepting"):
+            if d.get("p1") == self.net.uid:
+                self._duel_close_popup()
+                self._duel_start([uid, self.net.uid],
+                                 [D["host"], self.net.name])
+            else:
+                self._duel_over()                    # someone else was picked
+        elif D["state"] == "playing" and uid in D["uids"] \
+                and uid != self.net.uid:
+            idx = D["uids"].index(uid)
+            D["peer_seen"] = True
+            a = self._whole(d.get("a"), 0, 100000)
+            if a is not None:
+                D["peer_done"] = max(D["peer_done"], a)
+            r = self._whole(d.get("r"), 1, 100000)
+            if op == "ack":
+                return
+            if op == "quit":
+                self._duel_finish(1 - idx, "forfeit")
+            elif op == "cancel" and D["v2"]:
+                self._duel_abort("The interrupted duel was cancelled. No result.")
+            elif (r is None or r > (DUEL_MAX_ROUNDS if D["v2"] else D["r"] + 1)
+                  or r < D["r"] - 1):
+                return
+            elif op in ("commit", "commit_reveal"):
+                if op == "commit_reveal" and not D["v2"]:
+                    return
+                if D["v2"] and idx != ((r - 1) % 2 if op == "commit" else r % 2):
+                    return
+                h = d.get("h")
+                m, nonce = d.get("m"), d.get("nonce")
+                if op == "commit_reveal" and not (
+                        isinstance(m, str) and m in DUEL_MOVES
+                        and isinstance(nonce, str) and len(nonce) <= 32
+                        and duel_commit(gid, r, uid, m, nonce) == h):
+                    return
+                if (isinstance(h, str) and re.fullmatch(r"[0-9a-f]{64}", h)
+                        and (r, idx) not in D["commits"]):
+                    D["commits"][(r, idx)] = h
+                    if op == "commit_reveal":
+                        D["reveals"][(r, idx)] = (m, nonce)
+                    self._duel_progress()
+            elif op == "reveal":
+                m, nonce = d.get("m"), str(d.get("nonce", ""))[:32]
+                if isinstance(m, str) and m in DUEL_MOVES and (r, idx) not in D["reveals"]:
+                    D["reveals"][(r, idx)] = (m, nonce)
+                    self._duel_progress()
+
+    # ---- starting
+    def _duel_popup(self):
+        D, tk = self.duel, self.tk
+        win = tk.Toplevel(self.root)
+        win.title("Duel")
+        win.configure(bg=BG)
+        win.attributes("-topmost", True)
+        self.busy = True
+        tk.Label(win, text=f"{D['host']} wants to duel!", bg=BG, fg=FG,
+                 font=F(3, True)).pack(padx=24, pady=(16, 4))
+        tk.Label(win, text="A tiny fighting game. Each turn you both secretly\n"
+                 "pick a move. First to 0 HP loses. Only one person\n"
+                 "can accept.", bg=BG, fg=MUTED, font=F(),
+                 justify="center").pack(padx=20)
+        status = tk.Label(win, text="", bg=BG, fg=MUTED, font=F())
+        status.pack(pady=(6, 0))
+        row = tk.Frame(win, bg=BG)
+        row.pack(pady=(6, 16))
+        acc = tk.Button(row, text="Accept", width=10,
+                        command=self._duel_accept)
+        acc.pack(side="left", padx=6)
+        tk.Button(row, text="No thanks", width=10,
+                  command=self._duel_decline).pack(side="left", padx=6)
+        win.bind("<Escape>", lambda e: self._duel_decline())
+        win.protocol("WM_DELETE_WINDOW", self._duel_decline)
+        D["pop"], D["pop_status"], D["pop_acc"] = win, status, acc
+        self._center(win)
+
+    def _duel_accept(self):
+        D = self.duel
+        if D and not D["over"] and D["v2"] and D["state"] == "accepting":
+            self._duel_retry()
+            return
+        if not D or D["over"] or D["state"] != "invited":
+            return
+        D["state"] = "accepting"
+        D["accept_at"], D["accept_n"] = time.time(), 1
+        self._duel_send({"op": "accept"})
+        try:
+            D["pop_status"].config(text=f"Waiting for {D['host']}...")
+            D["pop_acc"].config(state="disabled")
+        except Exception:
+            pass
+
+    def _duel_decline(self):
+        D = self.duel
+        if D and not D["over"] and D["state"] in ("invited", "accepting"):
+            D["over"] = True                         # ignoring is never punished
+            if D["v2"]:
+                self.net.cancel_game(D["gid"])
+        self._duel_close_popup()
+
+    def _duel_start(self, uids, names):
+        D = self.duel
+        D.update(state="playing", uids=uids, names=names,
+                 me=uids.index(self.net.uid), S=duel_new(), r=1,
+                 t0=time.time(), resend_at=time.time() + 4)
+        self._duel_window()
+        self._duel_begin_round()
+
+    # ---- window
+    DUEL_SCALE = 4                                   # screen px per art px
+
+    def _duel_window(self):
+        D, tk = self.duel, self.tk
+        win = tk.Toplevel(self.root)
+        win.title(f"Duel: {D['names'][0]} vs {D['names'][1]}")
+        win.configure(bg=BG)
+        win.attributes("-topmost", True)
+        self.busy = True
+        sc = self.DUEL_SCALE
+        w = DUEL_LW * sc
+        cv = tk.Canvas(win, width=w, height=DUEL_LH * sc, bg="black",
+                       highlightthickness=0)
+        cv.pack(padx=10, pady=(10, 4))
+        status = tk.Label(win, text="", bg=BG, fg=FG, font=F(1, True))
+        status.pack()
+        info = tk.Label(win, text="", bg=BG, fg=MUTED, font=F(),
+                        wraplength=w, justify="center")
+        info.pack(padx=10)
+        row = tk.Frame(win, bg=BG)
+        row.pack(pady=8)
+        btns = {}
+        for n, m in enumerate(DUEL_ORDER, 1):
+            b = tk.Button(row, text=f"{n} {m}", width=8,
+                          command=lambda m=m: self._duel_pick(m))
+            b.pack(side="left", padx=2)
+            b.bind("<Enter>", lambda e, m=m: self._duel_hint(m))
+            b.bind("<Leave>", lambda e: self._duel_hint(None))
+            btns[m] = b
+            win.bind(str(n), lambda e, m=m: self._duel_pick(m))
+        if D["v2"]:
+            retry = tk.Button(win, text="Retry send", state="disabled",
+                              command=self._duel_retry)
+            retry.pack(pady=(0, 6))
+            D["retry_button"] = retry
+        helpl = tk.Label(win, text="", bg=BG, fg=MUTED, font=F(-1))
+        helpl.pack(pady=(0, 10))
+        win.protocol("WM_DELETE_WINDOW", self._duel_close_window)
+        D["win"] = win
+        D["ui"] = {"cv": cv, "status": status, "info": info, "btns": btns,
+                   "help": helpl}
+        D["fx"] = DuelFx(int(D["gid"], 16) & 0xFFFF)
+        D["phase"], D["stage"], D["bg_off"] = 0, None, (0, 0)
+        D["frame"], D["goal"] = duel_frame(D["S"]), None
+        self._center(win)
+        self._duel_draw(D["frame"])
+        self.root.after(130, self._duel_idle)
+
+    def _duel_idle(self):
+        """Keep the fighters breathing (and the blood settling) between turns."""
+        D = self.duel
+        if not D or not D.get("ui"):
+            return                                   # window closed: stop
+        try:
+            if not D["anim"]:
+                D["phase"] += 1
+                D["fx"].step()
+                self._duel_draw(D["frame"])
+        except Exception:
+            log("duel idle failed: " + traceback.format_exc())
+        self.root.after(130, self._duel_idle)
+
+    def _duel_hint(self, m):
+        D = self.duel
+        ui = D.get("ui") if D else None
+        if not ui:
+            return
+        if m is None:
+            ui["help"].config(text="")
+            return
+        d = DUEL_MOVES[m]
+        bits = [d["help"]]
+        if d["kind"] in ("strike", "throw"):
+            bits.append(f"start {d['su']}, reach {d['reach']}, "
+                        f"dmg {d['dmg']}, recover {d['rec']}")
+        ui["help"].config(text=f"{m}: " + "  ".join(bits))
+
+    def _duel_buttons(self, on):
+        D = self.duel
+        ui = D.get("ui") if D else None
+        if not ui:
+            return
+        for b in ui["btns"].values():
+            try:
+                b.config(state="normal" if on else "disabled")
+            except Exception:
+                pass
+
+    def _duel_close_window(self):
+        D = self.duel
+        if not D:
+            return
+        if D["state"] == "playing" and not D["over"]:
+            self._duel_forfeit()
+            return
+        win = D.get("win")
+        if win is not None:
+            try:
+                win.destroy()
+            except Exception:
+                pass
+        D["win"] = D["ui"] = None
+        self.busy = self.settings_win is not None
+        self._touch()
+
+    def _duel_forfeit(self):
+        D = self.duel
+        from tkinter import messagebox
+        self.busy = True
+        interrupted = D["v2"] and (not self.net.connected or any(
+            d["state"] in ("failed", "delayed") for d in self._duel_current_deliveries()))
+        if D.get("quitting") and not interrupted:
+            return
+        try:
+            ok = messagebox.askyesno(
+                "Duel", ("Cancel the interrupted duel? No result will be announced."
+                         if interrupted else "Forfeit the duel? Your opponent wins."),
+                parent=D.get("win") or self.root)
+        except Exception:
+            ok = False
+        if ok and not D["over"]:
+            if interrupted:
+                self._duel_abort("Interrupted duel cancelled. No result.")
+                self._duel_send({"op": "cancel"})
+                return
+            self._duel_out({"op": "quit", "r": 100000})   # resent for a while
+            if D["v2"]:
+                self.net.cancel_game(D["gid"])
+                D["quitting"] = True
+                self._duel_buttons(False)
+                D["ui"]["status"].config(text="Waiting to send forfeit...")
+            else:
+                self._duel_finish(1 - D["me"], "forfeit")
+        self.busy = self.settings_win is not None or bool(D.get("win"))
+
+    def _duel_draw(self, fr):
+        """Paint one frame: the backdrop only when the stage changes, the
+        fighters and effects every time."""
+        D = self.duel
+        ui = D.get("ui") if D else None
+        if not ui:
+            return
+        D["frame"] = fr
+        cv, sc, fx = ui["cv"], self.DUEL_SCALE, D["fx"]
+        stage = duel_stage_for(D["gid"], D["r"])
+        if D["stage"] != stage:
+            cv.delete("bg")
+            for (x, y, w, h, c) in duel_bg_rects(stage):
+                cv.create_rectangle(x * sc, y * sc, (x + w) * sc,
+                                    (y + h) * sc, fill=c, outline="",
+                                    tags="bg")
+            cv.tag_lower("bg")
+            D["stage"], D["bg_off"] = stage, (0, 0)
+        ox, oy = fx.offset()                         # screen shake
+        dx, dy = ox - D["bg_off"][0], oy - D["bg_off"][1]
+        if dx or dy:
+            cv.move("bg", dx * sc, dy * sc)
+            D["bg_off"] = (ox, oy)
+        cv.delete("fg")
+        for (x, y, w, h, c) in duel_fg_rects(fr, fx, D["phase"], D["goal"]):
+            cv.create_rectangle((x + ox) * sc, (y + oy) * sc,
+                                (x + ox + w) * sc, (y + oy + h) * sc,
+                                fill=c, outline="", tags="fg")
+        font = ("Courier New", 10, "bold")
+        for i in (0, 1):
+            p = fr["p"][i]
+            x0 = 6 if i == 0 else DUEL_LW - 6
+            cv.create_text((x0 + ox) * sc, (4 + oy) * sc,
+                           text=f"{D['names'][i]}  {max(0, p['hp'])}",
+                           fill=DUEL_COLS[i], font=font, tags="fg",
+                           anchor="nw" if i == 0 else "ne")
+            label = ("K.O." if p["ko"] else p["move"]
+                     or ("stunned" if p["stun"] else "ready")).upper()
+            cx = DUEL_MX + p["x"] * DUEL_U
+            cv.create_text((cx + ox) * sc, (DUEL_GY + 9 + oy) * sc,
+                           text=label, fill=DUEL_COLS[i],
+                           font=("Courier New", 9, "bold"), tags="fg")
+
+    # ---- playing
+    def _duel_begin_round(self):
+        D = self.duel
+        S = D["S"]
+        D["r"] = S["round"] + 1
+        D["pick"], D["nonce"], D["anim"] = None, "", False
+        for key in [k for k in D["commits"] if k[0] < D["r"] - 1]:
+            D["commits"].pop(key, None)
+        for key in [k for k in D["reveals"] if k[0] < D["r"] - 1]:
+            D["reveals"].pop(key, None)
+        need = duel_need(S)
+        ui = D.get("ui")
+        if not ui:
+            self._duel_progress()
+            return
+        mine = D["me"] in need
+        self._duel_buttons(mine)
+        self._duel_render_status()
+        ui["info"].config(text=D["last"])
+        self._duel_progress()
+
+    def _duel_pick(self, move):
+        D = self.duel
+        if (not D or D["state"] != "playing" or D["over"] or D["anim"]
+                or D.get("quitting") or D["pick"] is not None or move not in DUEL_MOVES):
+            return
+        S, me, r = D["S"], D["me"], D["r"]
+        need = duel_need(S)
+        if me not in need:
+            return
+        D["pick"] = move
+        D["resend_at"] = time.time() + 3
+        if len(need) == 2:
+            D["nonce"] = uuid.uuid4().hex[:16]
+            h = duel_commit(D["gid"], r, self.net.uid, move, D["nonce"])
+            D["commits"][(r, me)] = h
+            if not D["v2"]:
+                self._duel_out({"op": "commit", "r": r, "h": h})
+        else:
+            D["reveals"][(r, me)] = (move, "")
+            self._duel_out({"op": "reveal", "r": r, "m": move})
+        self._duel_buttons(False)
+        ui = D.get("ui")
+        if ui:
+            ui["status"].config(text=f"Locked in: {move}. Waiting for "
+                                f"{D['names'][1 - me]}...", fg=MUTED)
+        self._duel_progress()
+
+    def _duel_resend(self):
+        """The network can lose a message, and a player who can act alone
+        may be several rounds ahead. So keep saying every pick the other
+        side hasn't played past yet (harmless to repeat), plus an ack."""
+        D = self.duel
+        if D["v2"]:
+            return
+        for key in sorted(D["out"]):
+            if key[0] <= D["peer_done"]:
+                D["out"].pop(key, None)
+            else:
+                self._duel_send(D["out"][key])
+        self._duel_send({"op": "ack"})
+
+    def _duel_published(self, r, op):
+        return self.duel["delivery"].get((r, op), {}).get("state") == "published"
+
+    def _duel_v2_prepare(self, need):
+        """Alternate commitment roles; a queued move cannot advance combat."""
+        D = self.duel
+        r, me = D["r"], D["me"]
+        if me not in need:
+            return True
+        if D["pick"] is None:
+            return False
+        if len(need) == 1:
+            return self._duel_published(r, "reveal")
+        first = (r - 1) % 2
+        if me == first:
+            if (r, "commit") not in D["out"]:
+                self._duel_out({"op": "commit", "r": r,
+                                "h": D["commits"][(r, me)]})
+            if (not self._duel_published(r, "commit")
+                    or (r, 1 - me) not in D["reveals"]
+                    or (r, 1 - me) not in D["commits"]):
+                return False
+            move, nonce = D["reveals"][(r, 1 - me)]
+            if duel_commit(D["gid"], r, D["uids"][1 - me], move, nonce) != D["commits"][(r, 1 - me)]:
+                self._duel_abort("Invalid opponent commitment. No result.")
+                return False
+            op = "reveal"
+        else:
+            if (r, first) not in D["commits"]:
+                return False
+            op = "commit_reveal"
+        if (r, op) not in D["out"]:
+            D["reveals"][(r, me)] = (D["pick"], D["nonce"])
+            packet = {"op": op, "r": r, "m": D["pick"], "nonce": D["nonce"]}
+            if op == "commit_reveal":
+                packet["h"] = D["commits"][(r, me)]
+            self._duel_out(packet)
+        return self._duel_published(r, op)
+
+    def _duel_progress(self):
+        """Reveal when both have committed; play when all picks are known."""
+        D = self.duel
+        if (not D or D["state"] != "playing" or D["over"] or D["anim"]
+                or D.get("quitting")):
+            return
+        S, me, r = D["S"], D["me"], D["r"]
+        need = duel_need(S)
+        if D["v2"] and not self._duel_v2_prepare(need):
+            return
+        if (not D["v2"] and len(need) == 2 and D["pick"] is not None
+                and (r, me) not in D["reveals"]
+                and all((r, i) in D["commits"] for i in need)):
+            D["reveals"][(r, me)] = (D["pick"], D["nonce"])
+            self._duel_out({"op": "reveal", "r": r, "m": D["pick"],
+                            "nonce": D["nonce"]})
+            if D["anim"] or D["r"] != r:      # a reply already played it
+                return
+        choices = {}
+        for i in need:
+            raw = D["reveals"].get((r, i))
+            if raw is None:
+                return
+            m, nonce = raw
+            if len(need) == 2:
+                c = D["commits"].get((r, i))
+                if c is None:
+                    return
+                if i != me and duel_commit(D["gid"], r, D["uids"][i],
+                                           m, nonce) != c:
+                    self.note(f"{D['names'][i]}'s pick didn't match their "
+                              "commitment (cheating?). They forfeit.")
+                    self._duel_finish(me, "forfeit")
+                    return
+            choices[i] = m
+        D["anim"] = True
+        frames, ev = duel_round(S, choices)
+        D["last"] = self._duel_describe(choices, ev)
+        self._duel_buttons(False)
+        self._duel_animate(frames, 0)
+
+    def _duel_describe(self, choices, ev):
+        D = self.duel
+        n = D["names"]
+        parts = [f"{n[i]}: {choices[i]}" for i in sorted(choices)]
+        out = []
+        for e in ev:
+            bits = e.split(":")
+            if bits[0] == "hit":
+                out.append(f"{n[int(bits[1])]} got hit by {bits[2]}")
+            elif bits[0] == "blocked":
+                out.append(f"{n[int(bits[1])]} blocked it")
+            elif bits[0] == "counter":
+                out.append("counter hit!")
+            elif bits[0] == "tech":
+                out.append("throws clashed")
+        return "   ".join(parts) + ("  -  " + ", ".join(out) if out else
+                                    "  -  nothing connected")
+
+    def _duel_animate(self, frames, i, gid=None):
+        D = self.duel
+        if (not D or (gid is not None and D["gid"] != gid) or D["over"]
+                or D.get("quitting")):
+            return
+        if i < len(frames) and D.get("ui"):
+            fx = D["fx"]
+            fx.on_frame(frames[i])
+            D["phase"] += 1
+            self._duel_draw(frames[i])
+            fx.step()
+            delay = 45
+            if fx.hold:                              # hit-stop: freeze a beat
+                fx.hold -= 1
+                delay = 120
+            self.root.after(delay, lambda: self._duel_animate(frames, i + 1, D["gid"]))
+            return
+        S = D["S"]
+        if S["over"]:
+            self._duel_finish(S["winner"], "ko" if S["winner"] != -1 or
+                              S["p"][0]["hp"] == 0 else "time")
+        else:
+            self._duel_begin_round()
+
+    def _duel_finish(self, winner, why):
+        D = self.duel
+        if not D or D["over"]:
+            return
+        D["over"] = True
+        if D["v2"]:
+            self.net.cancel_game(D["gid"])
+        D["anim"] = False                    # let the idle loop paint the end
+        D["over_at"] = time.time()           # keep resending a little longer
+        if winner in (0, 1):
+            D["goal"] = (winner, 1 - winner)  # the flashing GO arrow
+        n = D["names"]
+        if winner == -1:
+            text = "Draw!"
+        elif winner == D["me"]:
+            text = "You win!" + (" (they forfeited)" if why == "forfeit" else "")
+        else:
+            text = "You lose." + (" (you forfeited)" if why == "forfeit" else "")
+        ui = D.get("ui")
+        if ui:
+            ui["status"].config(text=text, fg="#7be08a" if winner == D["me"]
+                                else "#ff7a7a" if winner != -1 else FG)
+            ui["info"].config(text=D["last"] + "\nClose this window when done.")
+            self._duel_buttons(False)
+        if D["mine"]:                                # the host tells the room
+            hp = [p["hp"] for p in D["S"]["p"]] if D["S"] else [0, 0]
+            if winner == -1:
+                msg = f"Duel: {n[0]} and {n[1]} drew."
+            else:
+                msg = (f"Duel: {n[winner]} beat {n[1 - winner]}"
+                       f" ({hp[winner]} HP left"
+                       f"{', by forfeit' if why == 'forfeit' else ''}).")
+            self.add(self.net.send(msg, extra={"color": name_color(
+                self.net.name)}))
+            self.redraw()
+
+    def _duel_peer_left(self, uid):
+        D = self.duel
+        if (D and not D["over"] and uid in D["uids"]
+                and uid != self.net.uid):
+            self._duel_finish(1 - D["uids"].index(uid), "forfeit")
+        elif D and not D["over"] and uid == D["host_uid"] \
+                and D["state"] in ("invited", "accepting"):
+            self._duel_over(f"{D['host']} left, so the duel was cancelled")
+
+    def _duel_tick(self, now):
+        D = self.duel
+        if D and D["v2"]:
+            if not D["over"] and now - D["t0"] > self.DUEL_SECONDS:
+                self._duel_abort("Duel timed out before completion. No result.")
+            self._duel_render_status()
+            return                       # cached relay delivery replaces all game retries
+        if D and D["over"] and D["state"] == "playing" and D["S"] \
+                and now - D.get("over_at", 0) < 40 and now > D["resend_at"]:
+            D["resend_at"] = now + 3         # so the other side can finish
+            self._duel_resend()
+        if not D or D["over"]:
+            return
+        if now - D["t0"] > self.DUEL_SECONDS:
+            if D["state"] == "playing":
+                self._duel_finish(-1, "time")
+            else:
+                self._duel_over("the duel timed out")
+            return
+        if D["state"] == "accepting" and now - D["accept_at"] > 4:
+            if D["accept_n"] >= 5:
+                self._duel_over(f"{D['host']} didn't answer, so the duel "
+                                "was dropped")
+                return
+            D["accept_n"] += 1
+            D["accept_at"] = now
+            self._duel_send({"op": "accept"})
+        elif D["state"] == "playing" and not D["anim"] and now > D["resend_at"]:
+            D["resend_at"] = now + 3
+            self._duel_resend()
+            if D["mine"] and not D["peer_seen"] and D["r"] == 1:
+                self._duel_send({"op": "go", "p1": D["uids"][1],
+                                 "n1": D["names"][1], "n0": D["names"][0]})
+
+    def _duel_abort(self, text):
+        D = self.duel
+        if not D or D["over"]:
+            return
+        D["over"], D["anim"] = True, False
+        self.net.cancel_game(D["gid"], keep_terminal=False)
+        self._duel_close_popup()
+        self._duel_buttons(False)
+        if D.get("ui"):
+            D["ui"]["status"].config(text=text, fg=MUTED)
+        self.note(text)
+
+    def _duel_retry(self):
+        D = self.duel
+        if D and D["v2"] and not D["over"]:
+            for delivery in self._duel_current_deliveries():
+                if delivery["state"] == "failed":
+                    self.net.retry(delivery["id"])
+
+    def _duel_current_deliveries(self):
+        D = self.duel
+        if D["state"] == "playing":
+            keys = {(D["r"], op) for op in ("commit", "commit_reveal", "reveal")}
+            if D["r"] == 1:
+                keys.add((None, "go"))
+            if D.get("quitting"):
+                keys = {(100000, "quit")}
+        else:
+            keys = {(None, "accept" if D["state"] == "accepting" else "challenge")}
+        return [d for key, d in D["delivery"].items() if key in keys]
+
+    def _delivery_text(self, delivery):
+        text = delivery.get("text") or "Waiting to send..."
+        retry_at = delivery.get("retry_at")
+        if (delivery.get("state") == "delayed" and retry_at is not None
+                and delivery.get("reason") != "daily_quota"):
+            seconds = max(0, math.ceil(retry_at - self.net.outbox.clock()))
+            text = (text.rstrip(".") + f" (~{seconds}s)." if seconds else "Waiting to send...")
+        return text
+
+    def _duel_render_status(self):
+        """Render the current phase, never the last callback's obsolete status."""
+        D = self.duel
+        if not D or D["over"] or D["anim"]:
+            return
+        pending = [d for d in self._duel_current_deliveries()
+                   if d["state"] not in ("published", "cancelled")] if D["v2"] else []
+        failed = any(d["state"] == "failed" for d in pending)
+        color = MUTED
+        if pending:
+            rank = {"failed": 0, "delayed": 1, "sending": 2, "queued": 3}
+            delivery = min(pending, key=lambda d: rank.get(d["state"], 4))
+            text = self._delivery_text(delivery)
+            if failed:
+                text += " Retry send, or cancel the interrupted duel."
+        elif D["v2"] and not self.net.connected:
+            text = "Waiting for the relay connection."
+        elif D["state"] != "playing":
+            text = (f"Waiting for {D['host']}..." if D["state"] == "accepting"
+                    else "Waiting for someone to accept...")
+        elif D.get("quitting"):
+            text = "Waiting to send forfeit..."
+        elif D["pick"] is not None:
+            text = f"Locked in: {D['pick']}. Waiting for {D['names'][1 - D['me']]}..."
+        else:
+            need = duel_need(D["S"])
+            other = D["names"][1 - D["me"]]
+            if D["me"] in need and len(need) == 2:
+                text, color = f"Round {D['r']}: pick your move (1-7)", FG
+            elif D["me"] in need:
+                text, color = (f"Round {D['r']}: {other} is still recovering. Your move!",
+                               "#7be08a")
+            else:
+                text = f"Round {D['r']}: you're still recovering, {other} is choosing..."
+        if D.get("ui"):
+            D["ui"]["status"].config(text=text, fg=color)
+            if D.get("retry_button"):
+                D["retry_button"].config(state="normal" if failed else "disabled")
+        elif D.get("pop") and D["state"] == "accepting":
+            D["pop_status"].config(text=text)
+            D["pop_acc"].config(text="Retry send" if failed else "Accept",
+                                state="normal" if failed else "disabled")
+
+    def _delivery_msg(self, msg):
+        """Only called on the Tk thread; transport threads never touch widgets."""
+        state, mid, gid = msg["state"], msg["id"], msg.get("gid")
+        D = self.duel
+        if D and D["v2"] and D["gid"] == gid:
+            key = next((k for k, d in D["delivery"].items() if d["id"] == mid), None)
+            if key is None:
+                return
+            delivery = D["delivery"][key]
+            if delivery["state"] in ("published", "cancelled") and state != delivery["state"]:
+                return                      # a stale callback cannot reopen a completed send
+            delivery.update({k: msg.get(k) for k in
+                             ("state", "text", "reason", "retry_at", "http_code")})
+            if D["over"]:
+                return
+            if state == "published":
+                if key[1] == "quit" and D.get("quitting"):
+                    self._duel_finish(1 - D["me"], "forfeit")
+                    return
+                self._duel_progress()
+            self._duel_render_status()
+            if (not D["over"] and not D.get("ui") and not D.get("pop")
+                    and delivery in self._duel_current_deliveries()
+                    and (state == "failed" or msg.get("reason") in ("server_limit", "daily_quota"))):
+                self.note(self._delivery_text(delivery) +
+                          " Type /retry to retry failed sends, or /duel to cancel.")
+            return
+        G = self.game
+        if G and G["gid"] == gid:
+            if G.get("guess_id") == mid:
+                G["guess_delivery"] = state
+                if state == "published":
+                    G["asked_at"] = time.time()
+                ui = G.get("ui")
+                if ui and not G["over"]:
+                    ui["status"].config(text=(f"Waiting for {G['host']}..."
+                        if state == "published" else self._delivery_text(msg)))
+                    if state == "failed":
+                        ui["guess"].config(text="Retry send", state="normal",
+                                           command=lambda: self.net.retry(mid))
+                        ui["skip"].config(state="normal")
+                    else:
+                        ui["guess"].config(state="disabled")
+            elif state == "failed":
+                self.note(msg.get("text", "Game message could not be sent.") +
+                          " Type /retry to retry.")
+            return
+        if state == "failed" and not gid:
+            self.note(msg.get("text", "Message could not be sent.") +
+                      " Type /retry to retry.")
 
     def _font_set(self):
         """Fonts installed on this computer (lower case)."""
@@ -3892,6 +5760,9 @@ class Overlay:
             self.note("couldn't restart by itself; please close and reopen")
 
     def _handle_incoming(self, msg):
+        if msg.get("type") == "delivery":
+            self._delivery_msg(msg)
+            return
         if msg.get("type") == "summon":
             self.set_state("active")
             self.reset_window_position()
@@ -3946,6 +5817,7 @@ class Overlay:
         mine = msg.get("uid") == self.net.uid
         if not mine and msg.get("type") == "leave":
             self._game_peer_left(msg.get("uid"))
+            self._duel_peer_left(msg.get("uid"))
         if not mine and msg.get("type") == "join" and FONT_SYNC \
                 and self.font_mine:
             # a newcomer doesn't know our fonts yet: tell them again soon
@@ -3957,6 +5829,9 @@ class Overlay:
             # versions of the app just ignore them.
             if isinstance(msg.get("game"), dict):
                 self._game_msg(msg)
+                return
+            if isinstance(msg.get("duel"), dict) or isinstance(msg.get("duel2"), dict):
+                self._duel_msg(msg)
                 return
             if isinstance(msg.get("fontlist"), list):
                 self._fontlist_msg(msg)
@@ -4069,13 +5944,16 @@ class Overlay:
                     120 if online else 15):
                 self.roll_done = True
                 self.update_online()
-            for job in (self._fonts_tick, self._game_tick):
+            for job in (self._fonts_tick, self._game_tick, self._duel_tick):
                 try:
                     job(now)
                 except Exception:
                     log("background job failed: " + traceback.format_exc())
             # tell others we're still here, and notice when someone stops
-            if now - self.last_ping > self.net.ping_every:
+            last_published = self.last_ping
+            if online:
+                last_published = max(last_published, self.net.outbox.last_published)
+            if now - last_published > self.net.ping_every:
                 self.last_ping = now
                 self.net.send("", kind="ping")
             for pname in self.presence.expired(now, 3 * self.net.ping_every):
