@@ -4413,15 +4413,18 @@ class Overlay:
                     G["over"] = True
         elif op == "result" and not G["mine"] and uid == G["host_uid"]:
             n = self._whole(g.get("n"), 1, G["max"])
-            guid, ok = g.get("guid"), g.get("ok") is True
+            guid, ok = g.get("guid"), g.get("ok")
             gname = str(g.get("gname", "?"))[:20]
             secret = self._whole(g.get("secret"), 1, G["max"])
-            if n is None or not isinstance(guid, str) or (ok and secret is None):
+            if (n is None or not isinstance(guid, str)
+                    or type(ok) is not bool or (ok and secret != n)):
                 return
             # Only a guess I made myself can disconnect me.
             mine = guid == self.net.uid and G["my_guess"] == n
             self._game_announce(gname, n, ok, secret)
-            if ok:
+            if mine and not ok:
+                G["over"] = True
+            elif ok:
                 G["over"] = True
             self._game_result_ui(mine, ok, gname, n, secret)
         elif op == "end" and not G["mine"] and uid == G["host_uid"]:
@@ -4507,13 +4510,16 @@ class Overlay:
         G = self.game
         ui = G.get("ui") if G else None
         if not ui:
+            if mine and not ok:
+                self.root.after(3000, self.disconnect)
             return
         if ok:
             text = (f"Awesome! You got it!\nThe number was {n}." if mine else
                     f"{gname} got it!\nThe number was {secret}.")
             color = "#7be08a"
         elif mine:
-            text = f"Wrong! The number wasn't {n}.\nYou're out for this round."
+            text = (f"Wrong! The number wasn't {n}.\n"
+                    "Study Chat will now close.")
             color = "#ff7a7a"
         else:
             return                           # someone else missed: keep going
@@ -4524,7 +4530,10 @@ class Overlay:
                 pass
         ui["title"].config(text=text, fg=color)
         gid = G["gid"]
-        self.root.after(5000, lambda: self._game_close_window(gid))
+        if mine and not ok:
+            self.root.after(3000, self.disconnect)
+        else:
+            self.root.after(5000, lambda: self._game_close_window(gid))
 
     def _game_close_window(self, gid=None):
         G = self.game
