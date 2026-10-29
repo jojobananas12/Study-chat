@@ -10,7 +10,7 @@ import random
 DUEL_W = 10                  # the arena is a row of tiles 0..DUEL_W
 DUEL_HP = 5
 DUEL_START = (3, 7)
-DUEL_MAX_ROUNDS = 25         # turns; then whoever has more HP wins
+DUEL_MAX_ROUNDS = 50         # turns; then whoever has more HP wins
 DUEL_SUB = 8                 # animation frames drawn per turn
 
 # Rules: turns = how many turns it takes, reach = how many tiles away it can
