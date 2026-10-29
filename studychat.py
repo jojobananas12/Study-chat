@@ -40,7 +40,7 @@ Late joiners:
 
 Settings:
   - Click "settings" in the top bar (or type /settings). Colors, opacity,
-    sizes, timings and more. Changes preview live; click Save to keep them.
+    sizes, timings and more. Changes preview and save automatically.
   - Your settings are saved in a file called .studychat.json in your home folder.
 
 School wifi:
@@ -856,7 +856,9 @@ DUEL_MOVES = {
                     su=2, act=2, rec=3,
                     help="1 turn, hits the 1 tile in front, no damage. Beats "
                          "block. If it lands, they lose 2 turns. If it fails, "
-                         "you lose 3 turns. Loses to jab and heavy."),
+                         "you lose 3 turns. A stunned fighter can be grabbed "
+                         "once before they recover. "
+                         "Loses to jab and heavy."),
     "block":   dict(kind="guard", turns=1, su=1, act=7, rec=3,
                     help="1 turn, covers your own tile. Stops jab and heavy, "
                          "and then the attacker loses their next turn. Loses "
@@ -894,7 +896,7 @@ def duel_new():
     """A fresh fight. Fighter 0 starts on the left."""
     def fighter(x, f):
         return {"x": x, "f": f, "hp": DUEL_HP, "move": None, "t": 0,
-                "stun": 0}
+                "stun": 0, "stun_grabbed": False}
     return {"p": [fighter(DUEL_START[0], 1), fighter(DUEL_START[1], -1)],
             "round": 0, "over": False, "winner": None}
 
@@ -1035,7 +1037,9 @@ def duel_round(S, choices):
                      DUEL_MOVES["heavy"]["su"] if act == "strike" else 0,
                      _anim_total(_ATTACKS[act][0]))
         if act == "grab":
-            if acts[d] in ("jab", "wind", "strike"):
+            if (acts[d] in ("jab", "wind", "strike")
+                    or (P[d]["stun"] > 0
+                        and P[d].get("stun_grabbed", False))):
                 continue                         # attacks beat a grab
             if land[d]:
                 if a == 0:
@@ -1043,6 +1047,8 @@ def duel_round(S, choices):
                 continue
             grabbed[a] = True
             stun[d] = max(stun[d], 2)
+            if P[d]["stun"] > 0:
+                P[d]["stun_grabbed"] = True
             cut[d] = True
             seen[d] = k
             ev.append((k, "grab:%d" % d))
@@ -1074,6 +1080,8 @@ def duel_round(S, choices):
         if acts[i] == "stunned":
             fi["stun"] -= 1
         fi["stun"] = max(fi["stun"], stun[i])
+        if fi["stun"] == 0:
+            fi["stun_grabbed"] = False
         if acts[i] == "wind" and not cut[i]:
             fi["move"], fi["t"] = "heavy", 1     # strikes next turn
         elif acts[i] in ("dash", "dash_back") and not cut[i]:
@@ -2156,7 +2164,7 @@ class Presence:
 
 # ------------------------------------------------------------ settings window
 class SettingsWindow:
-    """Tabs of settings. Changes preview live; Save keeps them, Cancel undoes."""
+    """Settings preview and persist live; Cancel restores the opening values."""
 
     def __init__(self, ov):
         import tkinter as tk
@@ -2202,7 +2210,8 @@ class SettingsWindow:
                          pady=(10, 0))
 
         ttk.Label(win, foreground="#666666",
-                  text="Changes preview live. Click Save to keep them."
+                  text="Changes preview and save automatically. Click Save "
+                       "to close."
                   ).pack(anchor="w", padx=12)
         bar = ttk.Frame(win)
         bar.pack(fill="x", padx=8, pady=8)
@@ -2321,7 +2330,25 @@ class SettingsWindow:
             self.swatches[key].config(bg=val)
         if self.job:
             self.win.after_cancel(self.job)
-        self.job = self.win.after(250, self.ov.apply_settings)
+        self.job = self.win.after(250, self._apply_and_persist)
+
+    def _apply_and_persist(self):
+        self.job = None
+        if self.closed:
+            return
+        self.ov.apply_settings()
+        self._persist()
+
+    def _persist(self):
+        try:
+            ok = save_settings()
+        except Exception:
+            log("couldn't save settings: "
+                + traceback.format_exc())
+            ok = False
+        if not ok:
+            self.ov.note("couldn't save your settings file")
+        return ok
 
     def _load_all(self, values):
         self.loading = True
@@ -2335,6 +2362,7 @@ class SettingsWindow:
 
     def reset(self):
         self._load_all(DEFAULTS)
+        self._persist()
 
     def cancel(self):
         snapshot = dict(self.snapshot)
@@ -2346,18 +2374,14 @@ class SettingsWindow:
         except Exception:
             log("couldn't restore settings while closing: "
                 + traceback.format_exc())
+            return
+        self._persist()
 
     def save(self):
         try:
-            ok = save_settings()
-        except Exception:
-            log("couldn't save settings while closing: "
-                + traceback.format_exc())
-            ok = False
+            self._persist()
         finally:
             self.close()
-        if not ok:
-            self.ov.note("couldn't save your settings file")
 
     def close(self):
         if self.closed:
@@ -4855,10 +4879,12 @@ class Overlay:
             x, facing = fighter.get("x"), fighter.get("f")
             hp, stun = fighter.get("hp"), fighter.get("stun")
             move, timer = fighter.get("move"), fighter.get("t")
+            stun_grabbed = fighter.get("stun_grabbed", False)
             if (type(x) is not int or not 0 <= x <= DUEL_W
                     or type(facing) is not int or facing not in (-1, 1)
                     or type(hp) is not int or not 0 <= hp <= DUEL_HP
                     or type(stun) is not int or not 0 <= stun <= 100
+                    or type(stun_grabbed) is not bool
                     or type(timer) is not int or not 0 <= timer <= 100
                     or (move is not None and (
                         not isinstance(move, str) or move not in DUEL_MOVES))):

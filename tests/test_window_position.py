@@ -307,10 +307,12 @@ class SettingsWindowCloseTests(unittest.TestCase):
 
         with patch.object(chat, "set_value",
                           side_effect=lambda *args: order.append("restore")), \
+                patch.object(chat, "save_settings", return_value=True) as save, \
                 patch.object(chat, "log"):
             chat.SettingsWindow.cancel(settings)
 
         self.assertEqual(order, ["close", "restore", "apply"])
+        save.assert_called_once_with()
 
     def test_cancel_stays_closed_if_preview_restore_fails(self):
         settings = self.window()
@@ -323,6 +325,17 @@ class SettingsWindowCloseTests(unittest.TestCase):
         settings.win.destroy.assert_called_once_with()
         self.assertIsNone(settings.ov.settings_win)
         self.assertFalse(settings.ov.busy)
+
+    def test_preview_changes_are_applied_and_persisted(self):
+        settings = self.window()
+        settings.job = "preview"
+
+        with patch.object(chat, "save_settings", return_value=True) as save:
+            chat.SettingsWindow._apply_and_persist(settings)
+
+        settings.ov.apply_settings.assert_called_once_with()
+        save.assert_called_once_with()
+        self.assertIsNone(settings.job)
 
 
 class SettingsTests(unittest.TestCase):

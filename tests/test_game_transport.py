@@ -252,6 +252,33 @@ class DuelProtocolTests(unittest.TestCase):
         chat.duel_round(state, {0: "wait"})
         self.assertEqual(state["p"][1]["stun"], 0)
 
+    def test_stunned_opponent_can_be_grabbed_once_before_recovering(self):
+        state = chat.duel_new()
+        state["p"][1]["x"] = state["p"][0]["x"] + 1
+
+        _, first_events = chat.duel_round(state, {0: "grab", 1: "wait"})
+        self.assertIn("grab:1", first_events)
+        self.assertEqual(state["p"][1]["stun"], 2)
+
+        _, second_events = chat.duel_round(state, {0: "grab"})
+        self.assertIn("grab:1", second_events)
+        self.assertEqual(state["p"][1]["stun"], 2)
+        self.assertTrue(state["p"][1]["stun_grabbed"])
+
+        _, third_events = chat.duel_round(state, {0: "grab"})
+
+        self.assertNotIn("grab:1", third_events)
+        self.assertIn("grab_fail:0:3", third_events)
+        self.assertEqual(state["p"][0]["stun"], 3)
+        self.assertEqual(state["p"][1]["stun"], 1)
+        self.assertTrue(state["p"][1]["stun_grabbed"])
+
+        chat.duel_round(state, {})
+
+        self.assertEqual(state["p"][1]["stun"], 0)
+        self.assertFalse(state["p"][1]["stun_grabbed"])
+        self.assertIn(1, chat.duel_need(state))
+
     def test_turn_advantage_draws_signed_and_centered_between_healthbars(self):
         state = chat.duel_new()
         state["p"][1]["stun"] = 1
@@ -704,6 +731,16 @@ class DuelSpectatorTests(unittest.TestCase):
         state = chat.duel_new()
         state["p"][0]["move"] = []
 
+        self.assertFalse(chat.Overlay._duel_valid_snapshot(state))
+
+    def test_snapshot_schema_validates_stun_grab_marker(self):
+        state = chat.duel_new()
+        self.assertTrue(chat.Overlay._duel_valid_snapshot(state))
+
+        del state["p"][0]["stun_grabbed"]
+        self.assertTrue(chat.Overlay._duel_valid_snapshot(state))
+
+        state["p"][0]["stun_grabbed"] = 1
         self.assertFalse(chat.Overlay._duel_valid_snapshot(state))
 
     def test_spectator_cannot_submit_a_fighter_move(self):
