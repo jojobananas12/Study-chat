@@ -252,6 +252,38 @@ class DuelProtocolTests(unittest.TestCase):
         chat.duel_round(state, {0: "wait"})
         self.assertEqual(state["p"][1]["stun"], 0)
 
+    def test_grab_connects_and_cancels_target_movement(self):
+        state = chat.duel_new()
+        state["p"][0]["x"], state["p"][1]["x"] = 4, 5
+
+        _, events = chat.duel_round(state, {0: "grab", 1: "retreat"})
+
+        self.assertIn("grab:1", events)
+        self.assertEqual(state["p"][1]["x"], 5)
+        self.assertEqual(state["p"][1]["stun"], 2)
+        self.assertIsNone(state["p"][1]["move"])
+
+    def test_grab_cancels_dash_before_second_movement_step(self):
+        state = chat.duel_new()
+        state["p"][0]["x"], state["p"][1]["x"] = 4, 5
+
+        _, events = chat.duel_round(state, {0: "grab", 1: "dash_back"})
+
+        self.assertIn("grab:1", events)
+        self.assertEqual(state["p"][1]["x"], 5)
+        self.assertIsNone(state["p"][1]["move"])
+        self.assertEqual(state["p"][1]["stun"], 2)
+
+    def test_grab_does_not_connect_if_target_starts_out_of_range(self):
+        state = chat.duel_new()
+        state["p"][0]["x"], state["p"][1]["x"] = 4, 6
+
+        _, events = chat.duel_round(state, {0: "grab", 1: "retreat"})
+
+        self.assertNotIn("grab:1", events)
+        self.assertIn("grab_fail:0:3", events)
+        self.assertEqual(state["p"][1]["x"], 7)
+
     def test_stunned_opponent_can_be_grabbed_once_before_recovering(self):
         state = chat.duel_new()
         state["p"][1]["x"] = state["p"][0]["x"] + 1
@@ -397,6 +429,38 @@ class DuelProtocolTests(unittest.TestCase):
         self.assertEqual([p["stun"] for p in state["p"]], [3, 3])
         self.assertIn("grab_fail:0:3", events)
         self.assertIn("grab_fail:1:3", events)
+
+    def test_both_stunned_after_grabs_advance_until_moves_are_available(self):
+        state = chat.duel_new()
+        state["p"][1]["x"] = state["p"][0]["x"] + 1
+        chat.duel_round(state, {0: "grab", 1: "grab"})
+        self.assertEqual(chat.duel_need(state), [])
+
+        overlay = chat.Overlay.__new__(chat.Overlay)
+        overlay.duel = {
+            "state": "playing", "over": False, "anim": False,
+            "S": state, "r": state["round"] + 1, "picks": {}, "me": 0,
+            "names": ["Player 0", "Player 1"], "hl": None,
+            "pick": None, "out": None, "resends": 0, "next_resend": 0,
+            "ui": None, "solo": False, "spectator": False,
+        }
+        overlay._duel_buttons = Mock()
+        overlay._duel_set_move_direction = (
+            chat.Overlay._duel_set_move_direction.__get__(overlay))
+        overlay._duel_begin_round = (
+            chat.Overlay._duel_begin_round.__get__(overlay))
+        overlay._duel_progress = (
+            chat.Overlay._duel_progress.__get__(overlay))
+        overlay._duel_animate = (
+            chat.Overlay._duel_animate.__get__(overlay))
+        overlay._duel_describe = (
+            chat.Overlay._duel_describe.__get__(overlay))
+
+        overlay._duel_progress()
+
+        self.assertEqual([p["stun"] for p in state["p"]], [0, 0])
+        self.assertEqual(chat.duel_need(state), [0, 1])
+        self.assertFalse(overlay.duel["anim"])
 
     def test_duplicate_events_and_reconnect_replay_do_not_repeat_turn(self):
         room = Room()
@@ -883,6 +947,40 @@ class DuelStatusTests(unittest.TestCase):
         self.ov.net.connected = True
         self.ov._duel_tick(time.time())
         self.assertEqual(self.status(), "Round 1: pick your move (1-5)")
+
+
+class DuelAnnouncementTests(unittest.TestCase):
+    def overlay(self, hp):
+        ov = chat.Overlay.__new__(chat.Overlay)
+        ov.duel = {
+            "over": False, "anim": True, "rematch_state": None,
+            "mine": True, "solo": False, "names": ["Alex", "Sam"],
+            "me": 0,
+            "S": {"p": [{"hp": hp[0]}, {"hp": hp[1]}]},
+            "ui": None,
+        }
+        ov.net = Mock()
+        ov.net.name = "Alex"
+        ov.add = Mock()
+        ov.redraw = Mock()
+        ov.net.send.return_value = "sent"
+        return ov
+
+    def test_undamaged_winner_uses_gapped_announcement(self):
+        ov = self.overlay([chat.DUEL_HP, 2])
+
+        chat.Overlay._duel_finish(ov, 0, "ko")
+
+        self.assertEqual(ov.net.send.call_args.args[0],
+                         "Sam got gapped by Alex")
+
+    def test_damaged_winner_keeps_regular_announcement(self):
+        ov = self.overlay([3, chat.DUEL_HP - 1])
+
+        chat.Overlay._duel_finish(ov, 1, "ko")
+
+        self.assertEqual(ov.net.send.call_args.args[0],
+                         "Duel: Sam beat Alex (4 HP left).")
 
 
 class NumberGuesserTests(unittest.TestCase):
