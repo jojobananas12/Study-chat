@@ -133,7 +133,7 @@ except Exception:
 # ------------------------------------------------------------------ version
 # Bump VERSION whenever you publish a new app version to GitHub. Everyone
 # running an older version is told, and can update with one click.
-VERSION = "1.19"
+VERSION = "1.21"
 UPDATE_REPO = "jojobananas12/Study-chat"     # github.com/<this>
 CHECK_UPDATES = os.environ.get("STUDYCHAT_NO_UPDATE") != "1"
 
@@ -257,6 +257,97 @@ SPEC = [
 SPEC_BY_KEY = {s[1]: s for s in SPEC}
 DEFAULTS = {s[1]: globals()[s[1]] for s in SPEC}
 SETTINGS_PATH = os.path.join(os.path.expanduser("~"), ".studychat.json")
+DUEL_LEADERBOARD_PATH = os.path.join(
+    os.path.expanduser("~"), ".studychat_duel_leaderboard.json")
+
+
+def _duel_leaderboard_default():
+    device = uuid.uuid4().hex
+    return {"device": device, "components": {device: {}}}
+
+
+def _duel_leaderboard_component(value):
+    if not isinstance(value, dict):
+        raise ValueError("invalid duel leaderboard component")
+    component = {}
+    for key, row in value.items():
+        if (not isinstance(key, str) or not isinstance(row, dict)
+                or not isinstance(row.get("name"), str)):
+            raise ValueError("invalid duel leaderboard entry")
+        name = "".join(c for c in row["name"] if c.isprintable()).strip()[:40]
+        wins = row.get("wins")
+        if (not name or key != name.casefold() or type(wins) is not int
+                or not 0 <= wins <= 1_000_000_000):
+            raise ValueError("invalid duel leaderboard entry")
+        component[key] = {"name": name, "wins": wins}
+    return component
+
+
+def _duel_leaderboard_clean(value):
+    if not isinstance(value, dict) or not isinstance(value.get("components"), dict):
+        raise ValueError("invalid duel leaderboard")
+    device = value.get("device")
+    components = value["components"]
+    if (not isinstance(device, str)
+            or not re.fullmatch(r"[0-9a-f]{32}", device)
+            or len(components) > 1000):
+        raise ValueError("invalid duel leaderboard")
+    clean = {}
+    for node, rows in components.items():
+        if not isinstance(node, str) or not re.fullmatch(r"[0-9a-f]{32}", node):
+            raise ValueError("invalid duel leaderboard device")
+        clean[node] = _duel_leaderboard_component(rows)
+    clean.setdefault(device, {})
+    return {"device": device, "components": clean}
+
+
+def load_duel_leaderboard():
+    try:
+        with open(DUEL_LEADERBOARD_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return _duel_leaderboard_default()
+    except (OSError, ValueError) as ex:
+        raise ValueError(f"couldn't read duel leaderboard: {ex}") from ex
+    return _duel_leaderboard_clean(data)
+
+
+def save_duel_leaderboard(data):
+    clean = _duel_leaderboard_clean(data)
+    temporary_path = DUEL_LEADERBOARD_PATH + ".tmp"
+    with open(temporary_path, "w", encoding="utf-8") as f:
+        json.dump(clean, f, ensure_ascii=False, separators=(",", ":"))
+    os.replace(temporary_path, DUEL_LEADERBOARD_PATH)
+
+
+def merge_duel_leaderboards(current, incoming):
+    """Merge win-counter components with a pointwise maximum."""
+    result = _duel_leaderboard_clean(current)
+    other = _duel_leaderboard_clean(incoming)
+    for device, rows in other["components"].items():
+        target = result["components"].setdefault(device, {})
+        for key, entry in rows.items():
+            old = target.get(key)
+            if old is None or entry["wins"] > old["wins"]:
+                target[key] = dict(entry)
+            elif (entry["wins"] == old["wins"]
+                  and (entry["name"].casefold(), entry["name"])
+                  < (old["name"].casefold(), old["name"])):
+                target[key] = dict(entry)
+    return result
+
+
+def duel_leaderboard_totals(data):
+    totals = {}
+    for rows in _duel_leaderboard_clean(data)["components"].values():
+        for key, entry in rows.items():
+            total = totals.setdefault(key, {"name": entry["name"], "wins": 0})
+            total["wins"] += entry["wins"]
+            if (entry["name"].casefold(), entry["name"]) < (
+                    total["name"].casefold(), total["name"]):
+                total["name"] = entry["name"]
+    return sorted(totals.values(),
+                  key=lambda row: (-row["wins"], row["name"].casefold()))
 
 
 def derive():
@@ -1745,6 +1836,8 @@ class Overlay:
         self.font_folder_noted = False
         self.game = None                    # the number guesser now running
         self.duel = None                    # the duel now running
+        self.duel_leaderboard = None         # persistent, room-merged win totals
+        self.duel_leaderboard_window = None
         self.full_anims = []                # ...and in full-size viewers
         self.presence = Presence()
         # Joining already says "I'm here", so the first "still here" signal
@@ -2646,22 +2739,27 @@ class Overlay:
     def _fill_menu(self, m):
         m.add_command(label="Who's online", command=self.show_who)
         m.add_separator()
+        games = self.tk.Menu(m, tearoff=0)
         if self.game and not self.game["over"] and self.game["mine"]:
-            m.add_command(label="End the number guesser",
-                          command=self.game_end_cmd)
+            games.add_command(label="End the number guesser",
+                              command=self.game_end_cmd)
         else:
-            m.add_command(label="Number guesser...", command=self.game_cmd)
+            games.add_command(label="Number guesser...",
+                              command=self.game_cmd)
         if self.duel and not self.duel["over"]:
             label = ("Stop spectating" if self.duel.get("spectator") else
                      "Quit the duel" if self.duel["state"] == "playing" else
                      "Cancel the duel")
-            m.add_command(label=label, command=self.duel_quit_cmd)
-        else:
-            m.add_command(label="Duel...", command=self.duel_cmd)
-            m.add_command(label="Watch duel in progress",
+            games.add_command(label=label, command=self.duel_quit_cmd)
+        games.add_command(label="Challenge the room...",
+                          command=self._duel_challenge_menu)
+        games.add_command(label="Watch duel in progress",
                           command=self._duel_watch_cmd)
-            m.add_command(label="Duel solo (testing)",
+        games.add_command(label="Duel solo (testing)",
                           command=self.duel_solo_cmd)
+        games.add_command(label="Duel leaderboard...",
+                          command=self.show_duel_leaderboard)
+        m.add_cascade(label="Games", menu=games)
         m.add_command(label="Flip everyone's chat", command=self.flip_cmd)
         m.add_command(label="Send GIF of the reel", command=self.clip_reel)
         m.add_command(label="Pick the reel area again",
@@ -2685,6 +2783,107 @@ class Overlay:
                       command=self.reset_window_position)
         m.add_separator()
         m.add_command(label="Disconnect and quit", command=self.disconnect)
+
+    def _duel_challenge_menu(self):
+        if self.duel and not self.duel["over"]:
+            self.note("finish or stop your current duel first")
+            return
+        self.duel_cmd()
+
+    def _duel_leaderboard_state(self):
+        if self.duel_leaderboard is None:
+            board = load_duel_leaderboard()
+            save_duel_leaderboard(board)
+            self.duel_leaderboard = board
+        return self.duel_leaderboard
+
+    def _duel_leaderboard_save(self):
+        try:
+            save_duel_leaderboard(self._duel_leaderboard_state())
+        except (OSError, ValueError) as ex:
+            log(f"couldn't save duel leaderboard: {ex}")
+            self.note("couldn't save the duel leaderboard")
+            return False
+        return True
+
+    def _duel_leaderboard_record_win(self, name):
+        try:
+            board = self._duel_leaderboard_state()
+            display_name = "".join(
+                c for c in str(name) if c.isprintable()).strip()[:40]
+            if not display_name:
+                raise ValueError("winner name is empty")
+            key = display_name.casefold()
+            rows = board["components"][board["device"]]
+            entry = rows.setdefault(
+                key, {"name": display_name, "wins": 0})
+            entry["wins"] += 1
+            entry["name"] = display_name
+            self._duel_leaderboard_save()
+            self._duel_leaderboard_render()
+            self.net.send("", kind="ping", extra={"duel": {
+                "op": "leaderboard_data", "board": board}})
+        except (OSError, ValueError) as ex:
+            log(f"couldn't record duel win: {ex}")
+            self.note("couldn't update the duel leaderboard")
+
+    def _duel_leaderboard_render(self):
+        view = self.duel_leaderboard_window
+        if not view:
+            return
+        rows = duel_leaderboard_totals(self._duel_leaderboard_state())
+        listing = view["list"]
+        listing.delete(0, "end")
+        if not rows:
+            listing.insert("end", "No wins recorded yet.")
+            return
+        for rank, row in enumerate(rows, 1):
+            listing.insert("end", f"{rank:>2}. {row['name']}  —  "
+                                  f"{row['wins']} wins")
+
+    def _duel_leaderboard_refresh(self):
+        self._duel_leaderboard_render()
+        self.net.send("", kind="ping",
+                      extra={"duel": {"op": "leaderboard_get"}})
+
+    def show_duel_leaderboard(self):
+        try:
+            self._duel_leaderboard_state()
+        except (OSError, ValueError) as ex:
+            log(f"couldn't load duel leaderboard: {ex}")
+            self.note("couldn't load the duel leaderboard")
+            return
+        if self.duel_leaderboard_window:
+            self._duel_leaderboard_refresh()
+            self.duel_leaderboard_window["win"].lift()
+            return
+        win = self.tk.Toplevel(self.root)
+        win.title("Duel leaderboard")
+        win.configure(bg=BG)
+        win.attributes("-topmost", True)
+        self.tk.Label(win, text="Room leaderboard — duel wins",
+                      bg=BG, fg=FG, font=F(2, True)).pack(padx=16, pady=10)
+        listing = self.tk.Listbox(
+            win, width=38, height=14, bg=BAR, fg=FG,
+            selectbackground=PILL_BG, font=F())
+        listing.pack(fill="both", expand=True, padx=12, pady=(0, 8))
+        buttons = self.tk.Frame(win, bg=BG)
+        buttons.pack(pady=(0, 10))
+        self.tk.Button(
+            buttons, text="Refresh", command=self._duel_leaderboard_refresh
+        ).pack(side="left", padx=5)
+
+        def close():
+            self.duel_leaderboard_window = None
+            win.destroy()
+            self._touch()
+
+        self.tk.Button(buttons, text="Close", command=close).pack(
+            side="left", padx=5)
+        win.protocol("WM_DELETE_WINDOW", close)
+        self.duel_leaderboard_window = {"win": win, "list": listing}
+        self._duel_leaderboard_refresh()
+        self._center(win)
 
     def _pop_menu(self, x, y):
         menu = self.tk.Menu(self.root, tearoff=0)
@@ -4023,12 +4222,34 @@ class Overlay:
     def _duel_msg(self, msg):
         """Everything the duel receives. Fields come from other computers,
         so every one is checked."""
-        if not self._ensure_duel_game():
-            return
-        d, uid = msg["duel"], msg.get("uid")
-        if not isinstance(uid, str) or not uid:
+        d, uid = msg.get("duel"), msg.get("uid")
+        if not isinstance(d, dict) or not isinstance(uid, str) or not uid:
             return
         op, gid = d.get("op"), d.get("gid")
+        if op == "leaderboard_get":
+            try:
+                board = self._duel_leaderboard_state()
+            except (OSError, ValueError) as ex:
+                log(f"couldn't load duel leaderboard: {ex}")
+                return
+            self.net.send("", kind="ping", extra={"duel": {
+                "op": "leaderboard_data", "p2": uid, "board": board}})
+            return
+        if op == "leaderboard_data":
+            if uid == self.net.uid or d.get("p2") not in (None, self.net.uid):
+                return
+            try:
+                merged = merge_duel_leaderboards(
+                    self._duel_leaderboard_state(), d.get("board"))
+                if merged != self.duel_leaderboard:
+                    self.duel_leaderboard = merged
+                    self._duel_leaderboard_save()
+                    self._duel_leaderboard_render()
+            except (OSError, ValueError) as ex:
+                log(f"couldn't merge duel leaderboard: {ex}")
+            return
+        if not self._ensure_duel_game():
+            return
         if op == "watch_list":
             D = self.duel
             if (D and D["mine"] and D["state"] == "playing"
@@ -4929,6 +5150,8 @@ class Overlay:
             self._duel_buttons(False)
         if D["mine"] and not D.get("solo"):          # the host tells the room
             hp = [p["hp"] for p in D["S"]["p"]] if D["S"] else [0, 0]
+            if winner in (0, 1):
+                self._duel_leaderboard_record_win(n[winner])
             if winner == -1:
                 msg = f"Duel: {n[0]} and {n[1]} drew."
             elif hp[winner] == DUEL_HP:

@@ -963,6 +963,7 @@ class DuelAnnouncementTests(unittest.TestCase):
         ov.net.name = "Alex"
         ov.add = Mock()
         ov.redraw = Mock()
+        ov._duel_leaderboard_record_win = Mock()
         ov.net.send.return_value = "sent"
         return ov
 
@@ -973,6 +974,7 @@ class DuelAnnouncementTests(unittest.TestCase):
 
         self.assertEqual(ov.net.send.call_args.args[0],
                          "Sam got gapped by Alex")
+        ov._duel_leaderboard_record_win.assert_called_once_with("Alex")
 
     def test_damaged_winner_keeps_regular_announcement(self):
         ov = self.overlay([3, chat.DUEL_HP - 1])
@@ -981,6 +983,115 @@ class DuelAnnouncementTests(unittest.TestCase):
 
         self.assertEqual(ov.net.send.call_args.args[0],
                          "Duel: Sam beat Alex (4 HP left).")
+
+
+class GamesMenuTests(unittest.TestCase):
+    def test_games_submenu_contains_number_guesser_and_duel_modes(self):
+        overlay = chat.Overlay.__new__(chat.Overlay)
+        overlay.tk = Mock()
+        overlay.game = None
+        overlay.duel = None
+        for action in (
+                "show_who", "game_cmd", "_duel_challenge_menu",
+                "_duel_watch_cmd", "duel_solo_cmd",
+                "show_duel_leaderboard", "flip_cmd",
+                "clip_reel", "open_reels", "open_fonts_folder",
+                "update_cmd", "open_settings", "reset_window_position",
+                "quit_cmd"):
+            setattr(overlay, action, Mock())
+        overlay.font_offers = overlay.font_share_offers = set()
+        overlay.update_info = None
+        menu = Mock()
+        submenu = Mock()
+        overlay.tk.Menu.return_value = submenu
+
+        chat.Overlay._fill_menu(overlay, menu)
+
+        menu.add_cascade.assert_called_once_with(label="Games", menu=submenu)
+        labels = [call.kwargs.get("label") for call in
+                  submenu.add_command.call_args_list]
+        self.assertEqual(labels, [
+            "Number guesser...", "Challenge the room...",
+            "Watch duel in progress", "Duel solo (testing)",
+            "Duel leaderboard...",
+        ])
+
+
+class DuelLeaderboardTests(unittest.TestCase):
+    def board(self, device, names):
+        return {
+            "device": device,
+            "components": {device: {
+                name.casefold(): {"name": name, "wins": wins}
+                for name, wins in names.items()
+            }},
+        }
+
+    def test_leaderboard_totals_merge_idempotently_and_persist(self):
+        device_a, device_b = "a" * 32, "b" * 32
+        left = self.board(device_a, {"Alex": 2, "Sam": 1})
+        right = self.board(device_b, {"Alex": 3, "Jo": 1})
+        merged = chat.merge_duel_leaderboards(left, right)
+
+        self.assertEqual(chat.duel_leaderboard_totals(merged), [
+            {"name": "Alex", "wins": 5},
+            {"name": "Jo", "wins": 1},
+            {"name": "Sam", "wins": 1},
+        ])
+        self.assertEqual(chat.merge_duel_leaderboards(merged, right), merged)
+
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(chat, "DUEL_LEADERBOARD_PATH",
+                             os.path.join(directory, "leaderboard.json")):
+            chat.save_duel_leaderboard(merged)
+            loaded = chat.load_duel_leaderboard()
+
+        self.assertEqual(chat.duel_leaderboard_totals(loaded),
+                         chat.duel_leaderboard_totals(merged))
+
+    def test_leaderboard_request_replies_with_local_persistent_state(self):
+        device = "a" * 32
+        overlay = chat.Overlay.__new__(chat.Overlay)
+        overlay.net = Mock()
+        overlay.net.uid = "local-user"
+        overlay.duel_leaderboard = self.board(device, {"Alex": 4})
+
+        chat.Overlay._duel_msg(overlay, {
+            "uid": "peer-user",
+            "duel": {"op": "leaderboard_get"},
+        })
+
+        self.assertEqual(overlay.net.send.call_args.kwargs["extra"], {
+            "duel": {
+                "op": "leaderboard_data", "p2": "peer-user",
+                "board": overlay.duel_leaderboard,
+            }
+        })
+
+    def test_room_leaderboard_data_merges_and_saves(self):
+        local_device, peer_device = "a" * 32, "b" * 32
+        overlay = chat.Overlay.__new__(chat.Overlay)
+        overlay.net = Mock()
+        overlay.net.uid = "local-user"
+        overlay.duel_leaderboard = self.board(local_device, {"Alex": 1})
+        overlay.duel_leaderboard_window = None
+        overlay.note = Mock()
+        peer_board = self.board(peer_device, {"Alex": 2, "Sam": 1})
+
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(chat, "DUEL_LEADERBOARD_PATH",
+                             os.path.join(directory, "leaderboard.json")):
+            chat.Overlay._duel_msg(overlay, {
+                "uid": "peer-user",
+                "duel": {"op": "leaderboard_data", "p2": "local-user",
+                         "board": peer_board},
+            })
+            loaded = chat.load_duel_leaderboard()
+
+        self.assertEqual(chat.duel_leaderboard_totals(loaded), [
+            {"name": "Alex", "wins": 3},
+            {"name": "Sam", "wins": 1},
+        ])
 
 
 class NumberGuesserTests(unittest.TestCase):
