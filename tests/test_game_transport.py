@@ -259,6 +259,7 @@ class DuelProtocolTests(unittest.TestCase):
         _, first_events = chat.duel_round(state, {0: "grab", 1: "wait"})
         self.assertIn("grab:1", first_events)
         self.assertEqual(state["p"][1]["stun"], 2)
+        self.assertTrue(state["p"][1]["grab_protected"])
 
         _, second_events = chat.duel_round(state, {0: "grab"})
         self.assertIn("grab:1", second_events)
@@ -273,11 +274,44 @@ class DuelProtocolTests(unittest.TestCase):
         self.assertEqual(state["p"][1]["stun"], 1)
         self.assertTrue(state["p"][1]["stun_grabbed"])
 
-        chat.duel_round(state, {})
+    def test_recovered_fighter_is_protected_until_their_next_action(self):
+        state = chat.duel_new()
+        state["p"][1]["x"] = state["p"][0]["x"] + 1
+
+        chat.duel_round(state, {0: "grab", 1: "wait"})
+        chat.duel_round(state, {0: "wait"})
+        chat.duel_round(state, {0: "wait"})
 
         self.assertEqual(state["p"][1]["stun"], 0)
-        self.assertFalse(state["p"][1]["stun_grabbed"])
+        self.assertTrue(state["p"][1]["grab_protected"])
         self.assertIn(1, chat.duel_need(state))
+
+        _, recovery_events = chat.duel_round(
+            state, {0: "grab", 1: "wait"})
+
+        self.assertNotIn("grab:1", recovery_events)
+        self.assertIn("grab_fail:0:3", recovery_events)
+        self.assertEqual(state["p"][1]["stun"], 0)
+        self.assertFalse(state["p"][1]["stun_grabbed"])
+        self.assertFalse(state["p"][1]["grab_protected"])
+
+    def test_grab_jab_sequence_cannot_reset_stun_indefinitely(self):
+        state = chat.duel_new()
+        state["p"][1]["x"] = state["p"][0]["x"] + 1
+
+        _, first = chat.duel_round(state, {0: "grab", 1: "wait"})
+        _, second = chat.duel_round(state, {0: "jab"})
+        _, third = chat.duel_round(state, {0: "grab"})
+        _, fourth = chat.duel_round(state, {0: "jab"})
+        _, fifth = chat.duel_round(state, {0: "grab"})
+
+        self.assertIn("grab:1", first)
+        self.assertIn("hit:1:jab", second)
+        self.assertIn("grab:1", third)
+        self.assertIn("hit:1:jab", fourth)
+        self.assertNotIn("grab:1", fifth)
+        self.assertIn("grab_fail:0:3", fifth)
+        self.assertTrue(state["p"][1]["grab_protected"])
 
     def test_turn_advantage_draws_signed_and_centered_between_healthbars(self):
         state = chat.duel_new()
@@ -741,6 +775,10 @@ class DuelSpectatorTests(unittest.TestCase):
         self.assertTrue(chat.Overlay._duel_valid_snapshot(state))
 
         state["p"][0]["stun_grabbed"] = 1
+        self.assertFalse(chat.Overlay._duel_valid_snapshot(state))
+
+        state["p"][0]["stun_grabbed"] = False
+        state["p"][0]["grab_protected"] = 1
         self.assertFalse(chat.Overlay._duel_valid_snapshot(state))
 
     def test_spectator_cannot_submit_a_fighter_move(self):

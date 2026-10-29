@@ -896,7 +896,8 @@ def duel_new():
     """A fresh fight. Fighter 0 starts on the left."""
     def fighter(x, f):
         return {"x": x, "f": f, "hp": DUEL_HP, "move": None, "t": 0,
-                "stun": 0, "stun_grabbed": False}
+                "stun": 0, "stun_grabbed": False,
+                "grab_protected": False}
     return {"p": [fighter(DUEL_START[0], 1), fighter(DUEL_START[1], -1)],
             "round": 0, "over": False, "winner": None}
 
@@ -1026,6 +1027,7 @@ def duel_round(S, choices):
     stun = [0, 0]                                # turns lost from now on
     cut = [False, False]                         # move cancelled
     grabbed = [False, False]                     # successful grab by fighter
+    grabbed_target = [False, False]
     seen = [None, None]                          # animation frame it shows on
     blocked = [False, False]                     # a block that stopped a hit
     for a in (0, 1):
@@ -1038,6 +1040,8 @@ def duel_round(S, choices):
                      _anim_total(_ATTACKS[act][0]))
         if act == "grab":
             if (acts[d] in ("jab", "wind", "strike")
+                    or (P[d].get("grab_protected", False)
+                        and P[d]["stun"] == 0)
                     or (P[d]["stun"] > 0
                         and P[d].get("stun_grabbed", False))):
                 continue                         # attacks beat a grab
@@ -1046,7 +1050,9 @@ def duel_round(S, choices):
                     ev.append((k, "tech"))       # both grabbed: nothing
                 continue
             grabbed[a] = True
+            grabbed_target[d] = True
             stun[d] = max(stun[d], 2)
+            P[d]["grab_protected"] = True
             if P[d]["stun"] > 0:
                 P[d]["stun_grabbed"] = True
             cut[d] = True
@@ -1080,8 +1086,9 @@ def duel_round(S, choices):
         if acts[i] == "stunned":
             fi["stun"] -= 1
         fi["stun"] = max(fi["stun"], stun[i])
-        if fi["stun"] == 0:
+        if acts[i] != "stunned" and not grabbed_target[i]:
             fi["stun_grabbed"] = False
+            fi["grab_protected"] = False
         if acts[i] == "wind" and not cut[i]:
             fi["move"], fi["t"] = "heavy", 1     # strikes next turn
         elif acts[i] in ("dash", "dash_back") and not cut[i]:
@@ -4880,11 +4887,13 @@ class Overlay:
             hp, stun = fighter.get("hp"), fighter.get("stun")
             move, timer = fighter.get("move"), fighter.get("t")
             stun_grabbed = fighter.get("stun_grabbed", False)
+            grab_protected = fighter.get("grab_protected", False)
             if (type(x) is not int or not 0 <= x <= DUEL_W
                     or type(facing) is not int or facing not in (-1, 1)
                     or type(hp) is not int or not 0 <= hp <= DUEL_HP
                     or type(stun) is not int or not 0 <= stun <= 100
                     or type(stun_grabbed) is not bool
+                    or type(grab_protected) is not bool
                     or type(timer) is not int or not 0 <= timer <= 100
                     or (move is not None and (
                         not isinstance(move, str) or move not in DUEL_MOVES))):
