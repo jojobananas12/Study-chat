@@ -1,0 +1,6 @@
+# Replace with your domain; DNS must point to your home public IP.
+chat.example.com {
+    reverse_proxy ntfy:80 {
+        flush_interval -1
+    }
+}

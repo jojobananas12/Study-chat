@@ -1,0 +1,11 @@
+# Replace this with the SAME public HTTPS origin used by every client.
+base-url: "https://chat.example.com"
+listen-http: ":80"
+cache-file: "/var/lib/ntfy/cache.db"
+cache-duration: "12h"
+auth-file: "/var/lib/ntfy/auth.db"
+auth-default-access: "deny-all"
+attachment-cache-dir: "/var/lib/ntfy/attachments"
+attachment-total-size-limit: "1G"
+attachment-file-size-limit: "15M"
+attachment-expiry-duration: "3h"
