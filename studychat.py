@@ -60,6 +60,7 @@ Commands: /disconnect (or /quit), /getfonts (install the free fonts your friends
   /reels [link] (small Instagram window; needs Chrome, Chromium,
   Edge or Brave, or pywebview), /reelgif (send a GIF of the reel; same as
   the "gif" button, "/reelgif area" picks the screen area again),
+  /castle (start a co-op Castle defense game for the room),
   /duel (challenge the room to a tiny turn-based fighting game),
   /duel watch (watch an active duel),
   /duel solo (test it alone: you control both fighters),
@@ -67,6 +68,15 @@ Commands: /disconnect (or /quit), /getfonts (install the free fonts your friends
   /version, /settings, /img, /quit. The chat checks GitHub for a newer
   version when it starts; set STUDYCHAT_NO_UPDATE=1 to turn that off.
   Duel rules and rendering are in duel_game.py, loaded when a duel is requested.
+
+Castle defense:
+  Menu > Games > Castle defense... (or /castle). Everyone in the room who
+  clicks Join plays together as one team (2 to 5 people) against waves of
+  enemies. A lone host plays with bots. The rules and window are in
+  castle_game.py and castle_macro.py, loaded when a game is requested (they
+  are downloaded from the repo if missing). Every laptop plays the same game
+  from the same seed; only each person's choices are sent (a few small
+  messages per round).
 
 Shared fonts:
   Fonts in ~/StudyChatFonts are offered to people in the room. When you accept
@@ -133,7 +143,7 @@ except Exception:
 # ------------------------------------------------------------------ version
 # Bump VERSION whenever you publish a new app version to GitHub. Everyone
 # running an older version is told, and can update with one click.
-VERSION = "1.21"
+VERSION = "1.22"
 UPDATE_REPO = "jojobananas12/Study-chat"     # github.com/<this>
 CHECK_UPDATES = os.environ.get("STUDYCHAT_NO_UPDATE") != "1"
 
@@ -693,6 +703,7 @@ def install_update(info):
                 f.write(previous_module)
             os.replace(restore_tmp, module_path)
         raise
+    refresh_castle_files(info["url"].rsplit("/", 1)[0])
     return ver
 
 
@@ -986,10 +997,71 @@ def __getattr__(name):
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
+# ------------------------------------------------------------- castle defense
+CASTLE_FILES = (("castle_macro.py", "class Game"),
+                ("castle_game.py", "class Session"))
+
+
+def _load_castle_game():
+    """Import castle_game (the window and flow) and castle_macro (the rules);
+    download whichever file is missing from the repo first."""
+    try:
+        import castle_game
+        return castle_game
+    except ModuleNotFoundError as ex:
+        if ex.name not in ("castle_game", "castle_macro"):
+            raise
+    here = os.path.dirname(os.path.abspath(__file__))
+    for name, marker in CASTLE_FILES:
+        path = os.path.join(here, name)
+        if os.path.exists(path):
+            continue
+        raw = _http_get(f"https://raw.githubusercontent.com/{UPDATE_REPO}/"
+                        f"main/{name}")
+        source = raw.decode("utf-8")
+        if marker not in source:
+            raise ValueError(f"downloaded {name} is incomplete")
+        compile(source, name, "exec")
+        with open(path + ".new", "wb") as f:
+            f.write(raw)
+        os.replace(path + ".new", path)
+    import importlib
+    importlib.invalidate_caches()
+    import castle_game
+    return castle_game
+
+
+def refresh_castle_files(base_url):
+    """After an update: replace the castle files if we have them. Failing is
+    fine, the game just keeps its old files."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    for name, marker in CASTLE_FILES:
+        path = os.path.join(here, name)
+        if not os.path.exists(path):
+            continue
+        try:
+            raw = _http_get(base_url + "/" + name)
+            source = raw.decode("utf-8")
+            if marker not in source:
+                continue
+            compile(source, name, "exec")
+            with open(path, "rb") as f:
+                old = f.read()
+            if old == raw:
+                continue
+            with open(path + ".bak", "wb") as f:
+                f.write(old)
+            with open(path + ".new", "wb") as f:
+                f.write(raw)
+            os.replace(path + ".new", path)
+        except Exception:
+            log("castle file refresh failed: " + traceback.format_exc())
+
+
 # ---------------------------------------------------------------- networking
 # Quiet "ping" messages that carry one of these are real requests (a game
 # move, a font file...), so the relay must retry them, never drop them.
-LOUD_KEYS = ("items", "flip", "game", "duel", "fontreq", "blob")
+LOUD_KEYS = ("items", "flip", "game", "duel", "castle", "fontreq", "blob")
 
 
 class Net:
@@ -1836,6 +1908,7 @@ class Overlay:
         self.font_folder_noted = False
         self.game = None                    # the number guesser now running
         self.duel = None                    # the duel now running
+        self.castle = None                  # the castle defense game now up
         self.duel_leaderboard = None         # persistent, room-merged win totals
         self.duel_leaderboard_window = None
         self.full_anims = []                # ...and in full-size viewers
@@ -2751,6 +2824,16 @@ class Overlay:
                      "Quit the duel" if self.duel["state"] == "playing" else
                      "Cancel the duel")
             games.add_command(label=label, command=self.duel_quit_cmd)
+        if self.castle and not self.castle["over"]:
+            games.add_command(
+                label=("Cancel castle defense" if self.castle["state"] in
+                       ("lobby", "invited", "joined") else
+                       "Quit castle defense"),
+                command=self.castle_quit_cmd)
+        else:
+            games.add_command(label="Castle defense...",
+                              command=self.castle_cmd)
+        games.add_separator()
         games.add_command(label="Challenge the room...",
                           command=self._duel_challenge_menu)
         games.add_command(label="Watch duel in progress",
@@ -3548,6 +3631,9 @@ class Overlay:
         if text in ("/guess", "/numberguess"):
             self.game_cmd()
             return
+        if text in ("/castle", "/castledefense"):
+            self.castle_cmd()
+            return
         if text == "/duel":
             self.duel_cmd()
             return
@@ -4091,6 +4177,437 @@ class Overlay:
                 G["ui"]["skip"].config(state="normal")
             except Exception:
                 pass
+
+    # ---- castle defense
+    # A co-op game for 2-5 people. The host opens a lobby, others click Join,
+    # the host presses Start. Then EVERY laptop runs the identical game from
+    # the same seed (castle_game.Session), so the only things sent are each
+    # person's own answers: a petition, the treasurer's split and one "moves"
+    # message per round (at most 2 per person per round, the relay is slow).
+    # Messages (all inside a "castle" ping, so old versions ignore them):
+    #   open / join / leave / start    the lobby (gid = this game)
+    #   m     one answer  {k: "round:kind:seat", v: value}
+    #   ask   "please say answer k again" (anyone who has it replies)
+    #   skip  {k}  the HOST replaces a missing player's step with a bot
+    CASTLE_ASK_AFTER = (40, 90, 150, 240, 360)   # seconds stuck before asking
+    CASTLE_LOBBY_SECONDS = 900
+    CASTLE_MAX_PLAYERS = 5
+
+    def _castle_blank(self, gid, host_uid, host, mine):
+        return {"gid": gid, "host_uid": host_uid, "host": host, "mine": mine,
+                "state": "lobby" if mine else "invited", "over": False,
+                "t0": time.time(), "roster": [[host_uid, host]], "diff": "Normal",
+                "pop": None, "win": None, "app": None, "sess": None,
+                "uids": [], "names": [], "seat": None, "away": set(),
+                "wait_key": None, "wait_t0": 0.0, "asks": 0,
+                "replied": {}, "ui": {}}
+
+    def _castle_ensure(self):
+        try:
+            return _load_castle_game()
+        except Exception as ex:
+            log("couldn't load castle defense: " + traceback.format_exc())
+            self.note(f"couldn't load Castle defense: {ex}")
+            return None
+
+    def _castle_send(self, d):
+        C = self.castle
+        if not C:
+            return
+        d = dict(d)
+        d["gid"] = C["gid"]
+        self.net.send("", kind="ping", extra={"castle": d})
+
+    def castle_cmd(self):
+        """Menu or /castle: open a lobby for the room."""
+        C = self.castle
+        if C and not C["over"]:
+            if C["state"] == "playing":
+                self.note("you're already in a Castle defense game")
+            elif C["mine"]:
+                self.note("your Castle defense lobby is already open")
+            else:
+                self.note(f"{C['host']} already has a Castle defense game up")
+            return
+        if self._castle_ensure() is None:
+            return
+        gid = uuid.uuid4().hex[:12]
+        self.castle = self._castle_blank(gid, self.net.uid, self.net.name, True)
+        self._castle_send({"op": "open"})
+        self._castle_lobby_window()
+        self.note("you opened a Castle defense lobby. Everyone gets an "
+                  "invite; press Start when your team has joined")
+
+    def castle_quit_cmd(self):
+        C = self.castle
+        if not C or C["over"]:
+            return
+        if C["state"] == "playing":
+            self._castle_leave("you left the Castle defense game")
+        elif C["mine"]:
+            self._castle_send({"op": "leave"})
+            self._castle_over("you cancelled Castle defense")
+        else:
+            self._castle_over(None)
+
+    def _castle_over(self, note=None):
+        C = self.castle
+        if not C:
+            return
+        C["over"] = True
+        for key in ("pop", "win"):
+            w = C.get(key)
+            if w is not None:
+                try:
+                    w.destroy()
+                except Exception:
+                    pass
+                C[key] = None
+        app = C.get("app")
+        if app is not None:
+            try:
+                app.shutdown()
+            except Exception:
+                pass
+            C["app"] = None
+        self.busy = (self.settings_win is not None
+                     or bool(self.duel and self.duel.get("win")))
+        self._touch()
+        if note:
+            self.note(note)
+
+    def _castle_leave(self, note):
+        """We close the game window (or choose Quit) mid-game."""
+        C = self.castle
+        app = (C or {}).get("app")
+        finished = app is not None and app.last_kind == "end"
+        if C and not C["over"] and not finished:
+            self._castle_send({"op": "leave"})
+        self._castle_over(note)
+
+    # ---- lobby
+    def _castle_lobby_window(self):
+        C, tk = self.castle, self.tk
+        win = tk.Toplevel(self.root)
+        win.title("Castle defense")
+        win.configure(bg=BG)
+        win.attributes("-topmost", True)
+        self.busy = True
+        tk.Label(win, text="Castle defense", bg=BG, fg=FG,
+                 font=F(3, True)).pack(padx=24, pady=(16, 2))
+        tk.Label(win, text="A co-op game for 2 to 5 people. Defend the keep "
+                 "for 12 rounds.\nAlone you play with bots.", bg=BG, fg=MUTED,
+                 font=F(), justify="center").pack(padx=20)
+        who = tk.Label(win, text="", bg=BG, fg=FG, font=F(), justify="left")
+        who.pack(padx=20, pady=8)
+        row = tk.Frame(win, bg=BG)
+        row.pack()
+        tk.Label(row, text="Difficulty:", bg=BG, fg=FG, font=F()).pack(side="left")
+        var = tk.StringVar(value=C["diff"])
+        for k in ("Easy", "Normal", "Hard"):
+            tk.Radiobutton(row, text=k, variable=var, value=k, bg=BG, fg=FG,
+                           selectcolor=BG, activebackground=BG,
+                           command=lambda: C.update(diff=var.get()),
+                           font=F()).pack(side="left", padx=3)
+        row2 = tk.Frame(win, bg=BG)
+        row2.pack(pady=(10, 16))
+        tk.Button(row2, text="Start game", width=12,
+                  command=self._castle_host_start).pack(side="left", padx=6)
+        tk.Button(row2, text="Cancel", width=10,
+                  command=self.castle_quit_cmd).pack(side="left", padx=6)
+        win.protocol("WM_DELETE_WINDOW", self.castle_quit_cmd)
+        C["win"], C["ui"] = win, {"who": who, "diff": var}
+        self._castle_refresh_lobby()
+        self._center(win)
+
+    def _castle_refresh_lobby(self):
+        C = self.castle
+        who = (C or {}).get("ui", {}).get("who")
+        if who is None:
+            return
+        names = [n for _, n in C["roster"]]
+        try:
+            who.config(text="In the team (%d/%d):\n%s" % (
+                len(names), self.CASTLE_MAX_PLAYERS,
+                "\n".join("  " + n for n in names)))
+        except Exception:
+            pass
+
+    def _castle_host_start(self):
+        C = self.castle
+        if not C or C["over"] or not C["mine"] or C["state"] != "lobby":
+            return
+        mod = self._castle_ensure()
+        if mod is None:
+            return
+        try:
+            C["diff"] = C["ui"]["diff"].get()
+        except Exception:
+            pass
+        seed = random.randrange(1, 10 ** 6)
+        uids = [u for u, _ in C["roster"]]
+        names = [n for _, n in C["roster"]]
+        self._castle_send({"op": "start", "uids": uids, "names": names,
+                           "seed": seed, "diff": C["diff"]})
+        self._castle_begin(uids, names, seed, C["diff"])
+
+    # ---- invitation (everyone else)
+    def _castle_popup(self):
+        C, tk = self.castle, self.tk
+        win = tk.Toplevel(self.root)
+        win.title("Castle defense")
+        win.configure(bg=BG)
+        win.attributes("-topmost", True)
+        self.busy = True
+        tk.Label(win, text=f"{C['host']} is starting Castle defense!", bg=BG,
+                 fg=FG, font=F(3, True)).pack(padx=24, pady=(16, 4))
+        tk.Label(win, text="A co-op game for up to 5 people. Everyone plays "
+                 "one role and\ndefends the keep together for 12 rounds.",
+                 bg=BG, fg=MUTED, font=F(), justify="center").pack(padx=20)
+        status = tk.Label(win, text="", bg=BG, fg=MUTED, font=F())
+        status.pack(pady=(6, 0))
+        row = tk.Frame(win, bg=BG)
+        row.pack(pady=(6, 16))
+        acc = tk.Button(row, text="Join", width=10, command=self._castle_join)
+        acc.pack(side="left", padx=6)
+        tk.Button(row, text="No thanks", width=10,
+                  command=self._castle_decline).pack(side="left", padx=6)
+        win.bind("<Escape>", lambda e: self._castle_decline())
+        win.protocol("WM_DELETE_WINDOW", self._castle_decline)
+        C["pop"], C["ui"] = win, {"status": status, "join": acc}
+        self._center(win)
+
+    def _castle_join(self):
+        C = self.castle
+        if not C or C["over"] or C["state"] != "invited":
+            return
+        C["state"] = "joined"
+        C["joined_at"], C["join_n"] = time.time(), 1
+        self._castle_send({"op": "join"})
+        try:
+            C["ui"]["status"].config(text=f"Joined. Waiting for {C['host']} "
+                                          "to press Start...")
+            C["ui"]["join"].config(state="disabled")
+        except Exception:
+            pass
+
+    def _castle_decline(self):
+        C = self.castle
+        if C and not C["over"] and C["state"] in ("invited", "joined"):
+            if C["state"] == "joined":
+                self._castle_send({"op": "leave"})
+            self._castle_over(None)
+
+    # ---- the game itself
+    def _castle_begin(self, uids, names, seed, diff):
+        C, tk = self.castle, self.tk
+        mod = self._castle_ensure()
+        if mod is None:
+            self._castle_over(None)
+            return
+        m = len(uids)
+        seat = uids.index(self.net.uid)
+        n = max(2, min(5, m)) if m > 1 else 4
+        names = [str(x)[:20] for x in names]
+        C.update(state="playing", uids=list(uids), names=names, seat=seat,
+                 t0=time.time())
+        if C["pop"] is not None:                 # lobby / invitation window
+            try:
+                C["pop"].destroy()
+            except Exception:
+                pass
+            C["pop"] = None
+        if C["win"] is not None:
+            try:
+                C["win"].destroy()
+            except Exception:
+                pass
+            C["win"] = None
+        win = tk.Toplevel(self.root)
+        win.title("Castle defense")
+        win.configure(bg=BG)
+        self.busy = True
+        try:
+            app = mod.App(win, tk, embedded=True,
+                          on_skip=self._castle_skip if C["mine"] else None,
+                          on_close=lambda: self._castle_leave(None))
+            sess = mod.Session(
+                n, humans=[seat], seed=int(seed), diff=diff,
+                remote=[i for i in range(m) if i != seat],
+                send=self._castle_game_send, names=names + [""] * (n - m))
+        except Exception:
+            log("castle start failed: " + traceback.format_exc())
+            try:
+                win.destroy()
+            except Exception:
+                pass
+            self._castle_over("couldn't start Castle defense")
+            return
+        C["win"], C["app"], C["sess"] = win, app, sess
+        win.protocol("WM_DELETE_WINDOW",
+                     lambda: self._castle_leave("you left the Castle "
+                                                "defense game"))
+        self.note("Castle defense started with " + ", ".join(names))
+        app.start_embedded(sess)
+
+    def _castle_game_send(self, key, value):
+        self._castle_send({"op": "m", "k": key, "v": value})
+
+    def _castle_skip(self, key):
+        """The host replaces a missing player's step with a bot."""
+        C = self.castle
+        if not C or C["over"] or C["state"] != "playing" or not C["mine"]:
+            return
+        self._castle_send({"op": "skip", "k": key})
+        self._castle_feed(key, {"skip": 1})
+
+    def _castle_feed(self, key, value):
+        C = self.castle
+        sess, app = C.get("sess"), C.get("app")
+        if sess is None or app is None:
+            return
+        sess.feed(key, value)
+        try:
+            app.pump()
+        except Exception:
+            log("castle pump failed: " + traceback.format_exc())
+            self._castle_over("Castle defense hit an error and closed")
+
+    # ---- receiving (every field comes from another computer)
+    def _castle_msg(self, msg):
+        d, uid = msg.get("castle"), msg.get("uid")
+        if not isinstance(d, dict) or not isinstance(uid, str) or not uid:
+            return
+        op, gid = d.get("op"), d.get("gid")
+        if not (isinstance(gid, str) and re.fullmatch(r"[0-9a-f]{12}", gid)):
+            return
+        name = str(msg.get("name", "?"))[:20]
+        C = self.castle
+        if op == "open":
+            if C and not C["over"]:
+                return                           # busy: ignore
+            if self._castle_ensure() is None:
+                return
+            self.castle = self._castle_blank(gid, uid, name, False)
+            self._castle_popup()
+            self.note(f"{name} is starting Castle defense (Games menu)")
+            return
+        if not C or C["over"] or C["gid"] != gid:
+            return
+        if op == "join" and C["mine"] and C["state"] == "lobby":
+            if all(u != uid for u, _ in C["roster"]) \
+                    and len(C["roster"]) < self.CASTLE_MAX_PLAYERS:
+                C["roster"].append([uid, name])
+                self._castle_refresh_lobby()
+                self.note(f"{name} joined Castle defense")
+        elif op == "start" and not C["mine"] and uid == C["host_uid"] \
+                and C["state"] in ("invited", "joined"):
+            uids, names = d.get("uids"), d.get("names")
+            seed, diff = d.get("seed"), d.get("diff")
+            ok = (isinstance(uids, list) and isinstance(names, list)
+                  and 1 <= len(uids) <= self.CASTLE_MAX_PLAYERS
+                  and len(names) == len(uids)
+                  and all(isinstance(u, str) for u in uids)
+                  and isinstance(seed, int) and 1 <= seed < 10 ** 9
+                  and diff in ("Easy", "Normal", "Hard"))
+            if not ok:
+                return
+            if self.net.uid in uids and C["state"] == "joined":
+                self._castle_begin(uids, [str(x) for x in names], seed, diff)
+            else:
+                self._castle_over(None)          # started without us
+        elif op == "leave":
+            if uid == C["host_uid"] and not C["mine"]:
+                self._castle_peer_left(uid)
+            elif C["state"] == "playing":
+                self._castle_peer_left(uid)
+            elif C["mine"] and C["state"] == "lobby":
+                C["roster"] = [r for r in C["roster"] if r[0] != uid]
+                self._castle_refresh_lobby()
+        elif C["state"] != "playing":
+            return
+        elif op == "m":
+            self._castle_answer_msg(d, uid)
+        elif op == "skip":
+            k = d.get("k")
+            if uid == C["host_uid"] and isinstance(k, str) and len(k) < 40:
+                self._castle_feed(k, {"skip": 1})
+        elif op == "ask":
+            k = d.get("k")
+            sess = C.get("sess")
+            now = time.time()
+            if (isinstance(k, str) and sess is not None and k in sess.sent
+                    and now - C["replied"].get(k, 0) > 15):
+                C["replied"][k] = now
+                self._castle_send({"op": "m", "k": k, "v": sess.sent[k]})
+
+    def _castle_answer_msg(self, d, uid):
+        C = self.castle
+        k, v = d.get("k"), d.get("v")
+        if not isinstance(k, str) or uid not in C["uids"]:
+            return
+        parts = k.split(":")
+        if len(parts) != 3 or parts[1] not in ("pet", "alloc", "ord") \
+                or not parts[0].isdigit() or not parts[2].isdigit():
+            return
+        if int(parts[2]) != C["uids"].index(uid):      # only your own seat
+            return
+        try:
+            if len(json.dumps(v)) > 8000:
+                return
+        except (TypeError, ValueError):
+            return
+        self._castle_feed(k, v)
+
+    def _castle_peer_left(self, uid):
+        C = self.castle
+        if not C or C["over"] or not isinstance(uid, str):
+            return
+        if C["state"] != "playing":
+            if uid == C["host_uid"] and not C["mine"]:
+                self._castle_over(f"{C['host']} left, so Castle defense "
+                                  "was cancelled")
+            return
+        if uid not in C["uids"]:
+            return
+        seat = C["uids"].index(uid)
+        if uid == C["host_uid"] and not C["mine"]:
+            self._castle_over(f"{C['host']} left, so Castle defense ended")
+            return
+        if seat != C["seat"] and seat not in C["away"]:
+            C["away"].add(seat)
+            self.note(f"{C['names'][seat]} left Castle defense. A bot takes "
+                      "over their seat")
+
+    def _castle_tick(self, now):
+        C = self.castle
+        if not C or C["over"]:
+            return
+        if C["state"] in ("lobby", "invited", "joined") \
+                and now - C["t0"] > self.CASTLE_LOBBY_SECONDS:
+            self._castle_over("the Castle defense lobby timed out")
+            return
+        if C["state"] == "joined" and C.get("join_n", 9) <= 2 \
+                and now - C.get("joined_at", now) > 20 * C["join_n"]:
+            C["join_n"] += 1                     # say "join" again twice
+            self._castle_send({"op": "join"})
+        if C["state"] != "playing" or C.get("sess") is None:
+            return
+        wait = C["sess"].waiting_on()
+        app = C.get("app")
+        if not wait or app is None or app.last_kind != "wait":
+            C["wait_key"], C["asks"] = None, 0
+            return
+        key, seat = wait
+        if key != C["wait_key"]:
+            C["wait_key"], C["wait_t0"], C["asks"] = key, now, 0
+        if C["mine"] and seat in C["away"]:
+            self._castle_skip(key)               # a bot stands in at once
+            return
+        if C["asks"] < len(self.CASTLE_ASK_AFTER) \
+                and now - C["wait_t0"] > self.CASTLE_ASK_AFTER[C["asks"]]:
+            C["asks"] += 1
+            self._castle_send({"op": "ask", "k": key})
 
     # ---- duel
     # /duel challenges the room; the first person to click Accept fights
@@ -5422,6 +5939,7 @@ class Overlay:
         if not mine and msg.get("type") == "leave":
             self._game_peer_left(msg.get("uid"))
             self._duel_peer_left(msg.get("uid"))
+            self._castle_peer_left(msg.get("uid"))
         if not mine and msg.get("type") == "join" and FONT_SYNC \
                 and self.font_mine:
             # a newcomer doesn't know our fonts yet: tell them again soon
@@ -5436,6 +5954,9 @@ class Overlay:
                 return
             if isinstance(msg.get("duel"), dict):
                 self._duel_msg(msg)
+                return
+            if isinstance(msg.get("castle"), dict):
+                self._castle_msg(msg)
                 return
             if isinstance(msg.get("fontlist"), list):
                 self._fontlist_msg(msg)
@@ -5548,7 +6069,8 @@ class Overlay:
                     120 if online else 15):
                 self.roll_done = True
                 self.update_online()
-            for job in (self._fonts_tick, self._game_tick, self._duel_tick):
+            for job in (self._fonts_tick, self._game_tick, self._duel_tick,
+                        self._castle_tick):
                 try:
                     job(now)
                 except Exception:
