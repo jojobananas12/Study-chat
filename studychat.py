@@ -4192,11 +4192,19 @@ class Overlay:
     CASTLE_ASK_AFTER = (40, 90, 150, 240, 360)   # seconds stuck before asking
     CASTLE_LOBBY_SECONDS = 900
     CASTLE_MAX_PLAYERS = 5
+    CASTLE_ROLES = ("Steward", "Engineer", "Slayer", "Smith", "Mage")
+    CASTLE_ROLE_HELP = {
+        "Steward": "builds farms and mines for gold income",
+        "Engineer": "builds towers and walls, repairs the keep",
+        "Slayer": "fights the enemies in one lane each round",
+        "Smith": "upgrades towers and plates the walls",
+        "Mage": "casts spells from the keep into any lane"}
 
     def _castle_blank(self, gid, host_uid, host, mine):
         return {"gid": gid, "host_uid": host_uid, "host": host, "mine": mine,
                 "state": "lobby" if mine else "invited", "over": False,
-                "t0": time.time(), "roster": [[host_uid, host]], "diff": "Normal",
+                "t0": time.time(), "roster": [[host_uid, host, []]], "diff": "Normal",
+                "roles": [], "bots": [], "plan": None,
                 "pop": None, "win": None, "app": None, "sess": None,
                 "uids": [], "names": [], "seat": None, "away": set(),
                 "wait_key": None, "wait_t0": 0.0, "asks": 0,
@@ -4248,7 +4256,7 @@ class Overlay:
             self._castle_send({"op": "leave"})
             self._castle_over("you cancelled Castle defense")
         else:
-            self._castle_over(None)
+            self._castle_decline()
 
     def _castle_over(self, note=None):
         C = self.castle
@@ -4285,7 +4293,86 @@ class Overlay:
             self._castle_send({"op": "leave"})
         self._castle_over(note)
 
-    # ---- lobby
+    CASTLE_ROLE_COLORS = {"Steward": "#7be08a", "Engineer": "#ffb347",
+                          "Slayer": "#ff6b6b", "Smith": "#c8c8d8",
+                          "Mage": "#b061ff"}       # same as in the game
+
+    def _castle_role_color(self, role):
+        try:
+            return _load_castle_game().ROLE_COL[role]
+        except Exception:
+            return self.CASTLE_ROLE_COLORS.get(role, FG)
+
+    @classmethod
+    def _castle_clean_roles(cls, x):
+        """A list of distinct valid role names, in the usual order."""
+        if not isinstance(x, list):
+            return []
+        return [r for r in cls.CASTLE_ROLES if r in x]
+
+    def _castle_set_roles(self, roles):
+        C = self.castle
+        if not C or C["over"]:
+            return
+        roles = self._castle_clean_roles(roles)
+        C["roles"] = roles
+        if C["mine"]:
+            C["roster"][0][2] = roles
+            C["dirty"] = True
+        elif C["state"] == "joined":             # changed their mind
+            self._castle_send({"op": "join", "roles": roles})
+        self._castle_refresh_lobby()
+
+    def _castle_set_role(self, role):
+        """Tick or untick one role for me (role "" clears them all)."""
+        C = self.castle
+        if not C or role not in ("",) + self.CASTLE_ROLES:
+            return
+        cur = list(C["roles"])
+        if role == "":
+            cur = []
+        elif role in cur:
+            cur.remove(role)
+        else:
+            cur.append(role)
+        self._castle_set_roles(cur)
+
+    def _castle_pick(self, role):
+        """A checkbox was clicked: read the boxes and set my roles."""
+        C = self.castle
+        try:
+            var = C["ui"]["var"]
+            self._castle_set_roles([r for r in self.CASTLE_ROLES
+                                    if var[r].get() == 1])
+        except Exception:
+            self._castle_set_role(role)
+
+    def _castle_plan_view(self):
+        """[(name, [roles], is_bot)] shown under "Seats when the game starts"."""
+        C = self.castle
+        if C["mine"]:
+            seats, _ = self._castle_plan(C["roster"], C["bots"])
+            return [(n, rs, not u) for u, n, rs in seats]
+        return list(C.get("plan") or [])
+
+    def _castle_bots_changed(self):
+        C = self.castle
+        if not C or C["over"] or not C["mine"]:
+            return
+        bv = C["ui"].get("botvars") or {}
+        C["bots"] = [r for r in self.CASTLE_ROLES
+                     if r in bv and bv[r].get() == 1]
+        C["dirty"] = True
+        self._castle_refresh_lobby()
+
+    def _castle_team(self):
+        """[(name, role)] as shown in the lobby."""
+        C = self.castle
+        if C["mine"]:
+            return [(n, list(r)) for _, n, r in C["roster"]]
+        return list(C.get("team") or [(C["host"], [])])
+
+    # ---- lobby (host and everyone who joined see the same screen)
     def _castle_lobby_window(self):
         C, tk = self.castle, self.tk
         win = tk.Toplevel(self.root)
@@ -4293,63 +4380,201 @@ class Overlay:
         win.configure(bg=BG)
         win.attributes("-topmost", True)
         self.busy = True
-        tk.Label(win, text="Castle defense", bg=BG, fg=FG,
-                 font=F(3, True)).pack(padx=24, pady=(16, 2))
+        tk.Label(win, text="Castle defense lobby", bg=BG, fg=FG,
+                 font=F(3, True)).pack(padx=24, pady=(14, 2))
         tk.Label(win, text="A co-op game for 2 to 5 people. Defend the keep "
                  "for 12 rounds.\nAlone you play with bots.", bg=BG, fg=MUTED,
                  font=F(), justify="center").pack(padx=20)
-        who = tk.Label(win, text="", bg=BG, fg=FG, font=F(), justify="left")
-        who.pack(padx=20, pady=8)
-        row = tk.Frame(win, bg=BG)
-        row.pack()
-        tk.Label(row, text="Difficulty:", bg=BG, fg=FG, font=F()).pack(side="left")
-        var = tk.StringVar(value=C["diff"])
-        for k in ("Easy", "Normal", "Hard"):
-            tk.Radiobutton(row, text=k, variable=var, value=k, bg=BG, fg=FG,
-                           selectcolor=BG, activebackground=BG,
-                           command=lambda: C.update(diff=var.get()),
-                           font=F()).pack(side="left", padx=3)
+        tk.Label(win, text="The team", bg=BG, fg=FG,
+                 font=F(0, True)).pack(anchor="w", padx=20, pady=(10, 0))
+        team = tk.Frame(win, bg=BG)
+        team.pack(fill="x", padx=26)
+        tk.Label(win, text="Pick your roles (as many or as few as you "
+                 "like)", bg=BG, fg=FG,
+                 font=F(0, True)).pack(anchor="w", padx=20, pady=(10, 0))
+        var = {}
+        radios = {}
+        box = tk.Frame(win, bg=BG)
+        box.pack(fill="x", padx=20)
+        for r in self.CASTLE_ROLES:
+            col = self._castle_role_color(r)
+            var[r] = tk.IntVar(value=1 if r in C["roles"] else 0)
+            rb = tk.Checkbutton(
+                box, text="", variable=var[r], bg=BG, fg=col,
+                selectcolor=BG, activebackground=BG, activeforeground=col,
+                anchor="w", justify="left", font=F(0, True),
+                command=lambda r=r: self._castle_pick(r))
+            rb.pack(fill="x", anchor="w")
+            radios[r] = rb
+        ui = {"team": team, "radios": radios, "var": var}
+        if C["mine"]:
+            tk.Label(win, text="Bots (host only): tick a role to give it to "
+                     "a bot", bg=BG, fg=FG,
+                     font=F(0, True)).pack(anchor="w", padx=20, pady=(8, 0))
+            brow = tk.Frame(win, bg=BG)
+            brow.pack(fill="x", padx=20)
+            ui["botvars"] = {}
+            for r in self.CASTLE_ROLES:
+                bv = tk.IntVar(value=1 if r in C["bots"] else 0)
+                ui["botvars"][r] = bv
+                tk.Checkbutton(
+                    brow, text=r, variable=bv, bg=BG,
+                    fg=self._castle_role_color(r), selectcolor=BG,
+                    activebackground=BG,
+                    activeforeground=self._castle_role_color(r),
+                    font=F(0, True),
+                    command=self._castle_bots_changed).pack(side="left")
+        tk.Label(win, text="Seats when the game starts", bg=BG, fg=FG,
+                 font=F(0, True)).pack(anchor="w", padx=20, pady=(8, 0))
+        plan = tk.Frame(win, bg=BG)
+        plan.pack(fill="x", padx=26)
+        warn = tk.Label(win, text="", bg=BG, fg=MUTED, font=F(),
+                        justify="left")
+        warn.pack(anchor="w", padx=26)
+        ui["plan"], ui["warn"] = plan, warn
+        if C["mine"]:
+            row = tk.Frame(win, bg=BG)
+            row.pack(pady=(8, 0))
+            tk.Label(row, text="Difficulty:", bg=BG, fg=FG,
+                     font=F()).pack(side="left")
+            dvar = tk.StringVar(value=C["diff"])
+            for k in ("Easy", "Normal", "Hard"):
+                tk.Radiobutton(row, text=k, variable=dvar, value=k, bg=BG,
+                               fg=FG, selectcolor=BG, activebackground=BG,
+                               command=lambda: C.update(diff=dvar.get()),
+                               font=F()).pack(side="left", padx=3)
+            ui["diff"] = dvar
+        status = tk.Label(win, text="" if C["mine"] else
+                          f"Waiting for {C['host']} to press Start...",
+                          bg=BG, fg=MUTED, font=F())
+        status.pack(pady=(8, 0))
         row2 = tk.Frame(win, bg=BG)
-        row2.pack(pady=(10, 16))
-        tk.Button(row2, text="Start game", width=12,
-                  command=self._castle_host_start).pack(side="left", padx=6)
-        tk.Button(row2, text="Cancel", width=10,
+        row2.pack(pady=(6, 14))
+        if C["mine"]:
+            tk.Button(row2, text="Start game", width=12,
+                      command=self._castle_host_start).pack(side="left", padx=6)
+        tk.Button(row2, text="Cancel" if C["mine"] else "Leave", width=10,
                   command=self.castle_quit_cmd).pack(side="left", padx=6)
         win.protocol("WM_DELETE_WINDOW", self.castle_quit_cmd)
-        C["win"], C["ui"] = win, {"who": who, "diff": var}
+        C["win"], C["ui"] = win, ui
         self._castle_refresh_lobby()
         self._center(win)
 
     def _castle_refresh_lobby(self):
-        C = self.castle
-        who = (C or {}).get("ui", {}).get("who")
-        if who is None:
+        C, tk = self.castle, self.tk
+        ui = (C or {}).get("ui") or {}
+        if "team" not in ui:
             return
-        names = [n for _, n in C["roster"]]
+        team = self._castle_team()
+        taken = {}
+        for n, rs in team:
+            for r in rs:
+                taken.setdefault(r, []).append(n)
         try:
-            who.config(text="In the team (%d/%d):\n%s" % (
-                len(names), self.CASTLE_MAX_PLAYERS,
-                "\n".join("  " + n for n in names)))
+            for w in ui["team"].winfo_children():
+                w.destroy()
+            for n, rs in team:
+                line = tk.Frame(ui["team"], bg=BG)
+                line.pack(fill="x")
+                tk.Label(line, text=n + "  ", bg=BG, fg=FG,
+                         font=F()).pack(side="left")
+                if not rs:
+                    tk.Label(line, text="no roles picked yet", bg=BG,
+                             fg=MUTED, font=F()).pack(side="left")
+                for k, r in enumerate(rs):
+                    tk.Label(line, text=r + (", " if k < len(rs) - 1 else ""),
+                             bg=BG, fg=self._castle_role_color(r),
+                             font=F(0, True)).pack(side="left")
+            for w in ui["plan"].winfo_children():
+                w.destroy()
+            for n, rs, bot in self._castle_plan_view():
+                line = tk.Frame(ui["plan"], bg=BG)
+                line.pack(fill="x")
+                tk.Label(line, text=n + ":  ", bg=BG, fg=MUTED if bot else FG,
+                         font=F()).pack(side="left")
+                for k, r in enumerate(rs):
+                    tk.Label(line, text=r + (", " if k < len(rs) - 1 else ""),
+                             bg=BG, fg=self._castle_role_color(r),
+                             font=F(0, True)).pack(side="left")
+            if C["mine"]:
+                ui["warn"].config(text="\n".join(
+                    self._castle_plan(C["roster"], C["bots"])[1]))
+            else:
+                ui["warn"].config(text="")
+            for r, rb in ui["radios"].items():
+                who = taken.get(r)
+                rb.config(text="%s: %s%s" % (
+                    r, self.CASTLE_ROLE_HELP[r],
+                    "   (picked by " + ", ".join(who) + ")" if who else ""))
         except Exception:
-            pass
+            log("castle lobby refresh failed: " + traceback.format_exc())
 
     def _castle_host_start(self):
         C = self.castle
         if not C or C["over"] or not C["mine"] or C["state"] != "lobby":
             return
-        mod = self._castle_ensure()
-        if mod is None:
+        if self._castle_ensure() is None:
             return
         try:
             C["diff"] = C["ui"]["diff"].get()
         except Exception:
             pass
         seed = random.randrange(1, 10 ** 6)
-        uids = [u for u, _ in C["roster"]]
-        names = [n for _, n in C["roster"]]
-        self._castle_send({"op": "start", "uids": uids, "names": names,
-                           "seed": seed, "diff": C["diff"]})
-        self._castle_begin(uids, names, seed, C["diff"])
+        seats, warns = self._castle_plan(C["roster"], C["bots"])
+        if not seats or any(not x[2] for x in seats) \
+                or any(w.startswith("Need") for w in warns):
+            self.note("Castle defense: " + (" ".join(
+                w for w in warns if w.startswith("Need")) or
+                "pick at least one role first"))
+            return
+        self._castle_send({"op": "start", "seats": seats, "seed": seed,
+                           "diff": C["diff"]})
+        self._castle_begin(seats, seed, C["diff"])
+
+    @classmethod
+    def _castle_plan(cls, roster, bots):
+        """Turn the lobby into seats. Nobody is given a role they did not
+        pick: a role nobody ticks stays unfilled (it never acts). A role two
+        people both picked goes to whoever ticked it first. A role the host
+        gave to a bot goes to that bot if it is free and there is room.
+        Returns (seats, warnings); a seat is [uid, name, [roles]] and uid ""
+        marks a bot. A person with no role gets a "Need..." warning and no
+        seat, and the host cannot start until they pick one."""
+        order = cls.CASTLE_ROLES
+        humans = [list(r) for r in roster[:cls.CASTLE_MAX_PLAYERS]]
+        claimed, owned, warns = {}, {}, []
+        for uid, name, roles in humans:
+            for role in order:
+                if role in (roles or []):
+                    if role in claimed:
+                        who = next(h[1] for h in humans
+                                   if h[0] == claimed[role])
+                        warns.append("%s: %s already has %s" % (
+                            name, who, role))
+                    else:
+                        claimed[role] = uid
+                        owned.setdefault(uid, []).append(role)
+        seated = [h for h in humans if owned.get(h[0])]
+        for uid, name, roles in humans:
+            if not owned.get(uid):
+                warns.append("Need a role for %s (pick one that is free)"
+                             % name)
+        kept = []
+        for r in order:
+            if r not in bots:
+                continue
+            if r in claimed:
+                who = next(h[1] for h in humans if h[0] == claimed[r])
+                warns.append(f"No bot {r}: {who} picked it")
+            elif len(seated) + len(kept) >= cls.CASTLE_MAX_PLAYERS:
+                warns.append(f"No room for a bot {r}")
+            else:
+                claimed[r] = "bot"
+                kept.append(r)
+        seats = [[uid, name, sorted(owned[uid], key=order.index)]
+                 for uid, name, roles in seated]
+        seats += [["", "Bot %d" % (i + 1), [r]] for i, r in enumerate(kept)]
+        return seats, warns
 
     # ---- invitation (everyone else)
     def _castle_popup(self):
@@ -4361,8 +4586,8 @@ class Overlay:
         self.busy = True
         tk.Label(win, text=f"{C['host']} is starting Castle defense!", bg=BG,
                  fg=FG, font=F(3, True)).pack(padx=24, pady=(16, 4))
-        tk.Label(win, text="A co-op game for up to 5 people. Everyone plays "
-                 "one role and\ndefends the keep together for 12 rounds.",
+        tk.Label(win, text="A co-op game for up to 5 people. Pick the "
+                 "roles you want\nand defend the keep together for 12 rounds.",
                  bg=BG, fg=MUTED, font=F(), justify="center").pack(padx=20)
         status = tk.Label(win, text="", bg=BG, fg=MUTED, font=F())
         status.pack(pady=(6, 0))
@@ -4383,13 +4608,15 @@ class Overlay:
             return
         C["state"] = "joined"
         C["joined_at"], C["join_n"] = time.time(), 1
-        self._castle_send({"op": "join"})
-        try:
-            C["ui"]["status"].config(text=f"Joined. Waiting for {C['host']} "
-                                          "to press Start...")
-            C["ui"]["join"].config(state="disabled")
-        except Exception:
-            pass
+        self._castle_send({"op": "join", "roles": C["roles"]})
+        pop = C["pop"]
+        C["pop"] = None
+        if pop is not None:
+            try:
+                pop.destroy()
+            except Exception:
+                pass
+        self._castle_lobby_window()              # now pick a role
 
     def _castle_decline(self):
         C = self.castle
@@ -4399,16 +4626,16 @@ class Overlay:
             self._castle_over(None)
 
     # ---- the game itself
-    def _castle_begin(self, uids, names, seed, diff):
+    def _castle_begin(self, seats, seed, diff):
         C, tk = self.castle, self.tk
         mod = self._castle_ensure()
         if mod is None:
             self._castle_over(None)
             return
-        m = len(uids)
+        n = len(seats)
+        uids = [x[0] for x in seats]
+        names = [str(x[1])[:20] for x in seats]
         seat = uids.index(self.net.uid)
-        n = max(2, min(5, m)) if m > 1 else 4
-        names = [str(x)[:20] for x in names]
         C.update(state="playing", uids=list(uids), names=names, seat=seat,
                  t0=time.time())
         if C["pop"] is not None:                 # lobby / invitation window
@@ -4433,8 +4660,9 @@ class Overlay:
                           on_close=lambda: self._castle_leave(None))
             sess = mod.Session(
                 n, humans=[seat], seed=int(seed), diff=diff,
-                remote=[i for i in range(m) if i != seat],
-                send=self._castle_game_send, names=names + [""] * (n - m))
+                remote=[i for i, u in enumerate(uids) if u and i != seat],
+                send=self._castle_game_send, names=names,
+                seats=[tuple(x[2]) for x in seats])
         except Exception:
             log("castle start failed: " + traceback.format_exc())
             try:
@@ -4447,7 +4675,9 @@ class Overlay:
         win.protocol("WM_DELETE_WINDOW",
                      lambda: self._castle_leave("you left the Castle "
                                                 "defense game"))
-        self.note("Castle defense started with " + ", ".join(names))
+        self.note("Castle defense started. Roles: " + "; ".join(
+            "%s = %s" % (names[i], ", ".join(sess.g.seats[i]))
+            for i in range(n)))
         app.start_embedded(sess)
 
     def _castle_game_send(self, key, value):
@@ -4495,25 +4725,62 @@ class Overlay:
         if not C or C["over"] or C["gid"] != gid:
             return
         if op == "join" and C["mine"] and C["state"] == "lobby":
-            if all(u != uid for u, _ in C["roster"]) \
-                    and len(C["roster"]) < self.CASTLE_MAX_PLAYERS:
-                C["roster"].append([uid, name])
+            role = self._castle_clean_roles(d.get("roles"))
+            known = [r for r in C["roster"] if r[0] == uid]
+            if known:
+                known[0][2] = role               # they changed their role
+                C["dirty"] = True
+                self._castle_refresh_lobby()
+            elif len(C["roster"]) < self.CASTLE_MAX_PLAYERS:
+                C["roster"].append([uid, name, role])
+                C["dirty"] = True
                 self._castle_refresh_lobby()
                 self.note(f"{name} joined Castle defense")
+        elif op == "roster" and not C["mine"] and uid == C["host_uid"] \
+                and C["state"] in ("invited", "joined"):
+            t = d.get("t")
+            if isinstance(t, list) and len(t) <= self.CASTLE_MAX_PLAYERS:
+                team = []
+                for it in t:
+                    if (isinstance(it, list) and len(it) == 2
+                            and isinstance(it[0], str)
+                            and isinstance(it[1], list)):
+                        team.append((it[0][:20],
+                                     self._castle_clean_roles(it[1])))
+                C["team"] = team
+                plan = []
+                for it in (d.get("plan") if isinstance(d.get("plan"), list)
+                           else [])[:5]:
+                    if (isinstance(it, list) and len(it) == 3
+                            and isinstance(it[0], str)
+                            and isinstance(it[1], list)
+                            and all(r in self.CASTLE_ROLES for r in it[1])):
+                        plan.append((it[0][:20], list(it[1]), bool(it[2])))
+                C["plan"] = plan
+                self._castle_refresh_lobby()
         elif op == "start" and not C["mine"] and uid == C["host_uid"] \
                 and C["state"] in ("invited", "joined"):
-            uids, names = d.get("uids"), d.get("names")
-            seed, diff = d.get("seed"), d.get("diff")
-            ok = (isinstance(uids, list) and isinstance(names, list)
-                  and 1 <= len(uids) <= self.CASTLE_MAX_PLAYERS
-                  and len(names) == len(uids)
-                  and all(isinstance(u, str) for u in uids)
+            seats, seed, diff = d.get("seats"), d.get("seed"), d.get("diff")
+            ok = (isinstance(seats, list) and 1 <= len(seats) <= 5
                   and isinstance(seed, int) and 1 <= seed < 10 ** 9
                   and diff in ("Easy", "Normal", "Hard"))
+            clean, used = [], []
+            for it in (seats if ok else []):
+                if not (isinstance(it, list) and len(it) == 3
+                        and isinstance(it[0], str) and isinstance(it[1], str)
+                        and isinstance(it[2], list) and it[2]
+                        and all(r in self.CASTLE_ROLES for r in it[2])):
+                    ok = False
+                    break
+                clean.append([it[0], it[1][:20], list(it[2])])
+                used += it[2]
+            ok = ok and used and len(set(used)) == len(used) \
+                and any(x[0] for x in clean)
             if not ok:
                 return
+            uids = [x[0] for x in clean]
             if self.net.uid in uids and C["state"] == "joined":
-                self._castle_begin(uids, [str(x) for x in names], seed, diff)
+                self._castle_begin(clean, seed, diff)
             else:
                 self._castle_over(None)          # started without us
         elif op == "leave":
@@ -4523,6 +4790,7 @@ class Overlay:
                 self._castle_peer_left(uid)
             elif C["mine"] and C["state"] == "lobby":
                 C["roster"] = [r for r in C["roster"] if r[0] != uid]
+                C["dirty"] = True
                 self._castle_refresh_lobby()
         elif C["state"] != "playing":
             return
@@ -4587,10 +4855,17 @@ class Overlay:
                 and now - C["t0"] > self.CASTLE_LOBBY_SECONDS:
             self._castle_over("the Castle defense lobby timed out")
             return
+        if C["mine"] and C["state"] == "lobby" and C.get("dirty") \
+                and now - C.get("roster_at", 0) > 3:
+            C["dirty"], C["roster_at"] = False, now
+            seats, _ = self._castle_plan(C["roster"], C["bots"])
+            self._castle_send({"op": "roster",
+                               "t": [[n, r] for _, n, r in C["roster"]],
+                               "plan": [[n, rs, not u] for u, n, rs in seats]})
         if C["state"] == "joined" and C.get("join_n", 9) <= 2 \
                 and now - C.get("joined_at", now) > 20 * C["join_n"]:
             C["join_n"] += 1                     # say "join" again twice
-            self._castle_send({"op": "join"})
+            self._castle_send({"op": "join", "roles": C["roles"]})
         if C["state"] != "playing" or C.get("sess") is None:
             return
         wait = C["sess"].waiting_on()

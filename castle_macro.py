@@ -65,7 +65,7 @@ WALL_HP, PLATING_HP = 6, 6
 STRUCT_HP = {"farm": 4, "mine": 6, "tower": 8}   # buildings sit in lane cells
 TIER_HP = 2                                       # a tower upgrade adds this
 MANA_BASE = 3
-SIZE_ADJ = {2: 0.90, 3: 0.88, 4: 0.92, 5: 0.89}   # evens out win rates by table size (six lanes)
+SIZE_ADJ = {1: 0.88, 2: 0.90, 3: 0.88, 4: 0.92, 5: 0.89}   # evens out win rates by table size (six lanes)
 
 SEATS = {
     2: [("Steward", "Engineer", "Smith"), ("Slayer", "Mage")],
@@ -170,12 +170,25 @@ BUILD_UPGRADES = {"Steward": ("clerks1",), "Engineer": ("hammer1", "hammer2"),
 #  THE GAME (pure rules, no window, no network)
 # ======================================================================
 class Game:
-    def __init__(self, n=4, seed=1, diff=1.7, treasurer="draft"):
-        if n not in SEATS:
+    def __init__(self, n=4, seed=1, diff=1.7, treasurer="draft", seats=None):
+        """seats: optional [(role, ...), ...], one entry per seat, that
+        splits SOME or ALL of the five roles between 1-5 seats (a role nobody
+        takes stays unfilled and simply never acts).
+        Without it the standard split for n players is used."""
+        if seats is not None:
+            roles = sorted(r for grp in seats for r in grp)
+            ALL = ["Steward", "Engineer", "Slayer", "Smith", "Mage"]
+            if not 1 <= len(seats) <= 5 or not roles \
+                    or len(set(roles)) != len(roles) \
+                    or any(r not in ALL for r in roles) \
+                    or any(not grp for grp in seats):
+                raise ValueError("each role may belong to at most one seat")
+            n = len(seats)
+        elif n not in SEATS:
             raise ValueError("2 to 5 players")
         self.n, self.seed, self.diff = n, seed, diff
         self.treasurer_style = treasurer
-        self.seats = [list(s) for s in SEATS[n]]
+        self.seats = [list(s) for s in (seats if seats is not None else SEATS[n])]
         self.owner = {r: p for p, rs in enumerate(self.seats) for r in rs}
         self.cap = [VAULT_CAP_BASE + VAULT_CAP_EXTRA * (len(rs) - 1)
                     for rs in self.seats]
@@ -1149,8 +1162,9 @@ def bot_round(g, bots, rng, human_orders=None):
 # ======================================================================
 #  SIMULATOR
 # ======================================================================
-def play_game(n, seed, styles=None, treasurer="draft", diff=1.7):
-    g = Game(n, seed, diff, treasurer)
+def play_game(n, seed, styles=None, treasurer="draft", diff=1.7, seats=None):
+    g = Game(n, seed, diff, treasurer, seats)
+    n = g.n
     styles = styles or ["balanced"] * n
     bots = [Bot(styles[i % len(styles)]) for i in range(n)]
     rng = random.Random(seed * 31 + 5)

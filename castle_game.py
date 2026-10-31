@@ -2765,12 +2765,13 @@ class Session:
 
     def __init__(self, n=4, humans=(0,), seed=1, diff="Normal",
                  treasurer="draft", styles=("balanced", "saver", "spender"),
-                 remote=(), send=None, names=None):
+                 remote=(), send=None, names=None, seats=None):
         """remote: seats played by people on OTHER computers. send(key, value)
         is called with every answer a local person gives, so the others can
         feed it to their own copy (see feed). Every computer runs the same
         game from the same seed, so only these answers are ever sent."""
-        self.g = Game(n, seed, DIFFICULTY.get(diff, diff), treasurer)
+        self.g = Game(n, seed, DIFFICULTY.get(diff, diff), treasurer, seats)
+        n = self.g.n
         SEAT_NAMES.clear()
         for i, nm in enumerate(names or []):
             if nm:
@@ -4684,6 +4685,26 @@ def run_tests(verbose=True):
         check(sent <= (ss[0].g.round + 1) * m * 3, "too many messages: %d" % sent)
     say("lockstep chat game: 2-5 computers, repeated and shuffled messages, "
         "and a missing player replaced by a bot all end in the same state")
+
+    # ---- 9c. custom seats: any split of the five roles between 1 and 5 seats
+    for seats in ([("Mage", "Slayer", "Steward", "Smith", "Engineer")],
+                  [("Mage",), ("Slayer", "Steward", "Smith", "Engineer")],
+                  [("Steward", "Engineer"), ("Smith",), ("Slayer", "Mage")]):
+        g = cm.play_game(0, 5, seats=seats)
+        check(g.over and g.n == len(seats), "custom seats game did not finish")
+    for seats in ([("Mage",)], [("Steward", "Smith"), ("Mage",)], [("Slayer",), ("Smith",), ("Steward",)]):
+        g = cm.play_game(0, 5, seats=seats)       # some roles left unfilled
+        check(g.over and g.n == len(seats), "partial seats game did not finish")
+    for bad in ([], [("Mage",), ("Mage", "Slayer", "Smith", "Engineer", "Steward")],
+                [("Mage", "Slayer", "Smith", "Engineer", "Steward"), ()]):
+        try:
+            cm.Game(2, 1, 1.9, "draft", bad)
+            check(False, "bad seat split was accepted")
+        except ValueError:
+            pass
+    s = Session(0, humans=[0], seed=3, seats=[("Mage",), ("Slayer", "Steward", "Smith", "Engineer")])
+    check(s.g.n == 2 and s.g.seats[1][0] == "Slayer", "Session ignored custom seats")
+    say("custom seats: any split of the five roles works, bad splits are refused")
 
     # ---- 10. the window code, run against a pretend Tk
     ui_smoke(check, say)
